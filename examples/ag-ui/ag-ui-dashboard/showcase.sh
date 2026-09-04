@@ -49,7 +49,33 @@ cleanup() {
     [ -n "${TAIL_PID}" ] && kill "${TAIL_PID}" >/dev/null 2>&1 || true
     rm -f "${FRAMES}" "${EMIT_OUT}"
 }
-trap cleanup EXIT INT TERM
+# Completion guard. On macOS bash 3.2 — the only bash here, and what
+# `#!/usr/bin/env bash` resolves to — a `set -u` abort in a script that has an EXIT
+# trap delivers status 0 to the trap, so this demo could fail to launch and still
+# report success. Only a ZERO status has to prove it was deliberate; nonzero exits
+# (including Ctrl-C's 130) are failures either way and pass through untouched.
+#
+# INT/TERM keep their own trap so signal behaviour is unchanged; only EXIT is
+# rerouted through the guard, which still runs cleanup.
+COMPLETED=0
+finish() { COMPLETED=1; exit "${1:-0}"; }
+__guard_on_exit() {
+  local s=$?
+  # In a SUBSHELL on purpose: most of these cleanup functions end with
+  # `exit "${code}"` where code=$? is captured at their entry, which here would be
+  # 0 and would exit 0 straight past the check below. That `exit` inside cleanup is
+  # also precisely what made the original `trap cleanup EXIT` swallow the aborted
+  # status. Running it in a subshell keeps its side effects and leaves the exit
+  # status to this handler. INT/TERM still call cleanup directly, unchanged.
+  ( cleanup ) || true
+  if [ "$s" = "0" ] && [ "$COMPLETED" != "1" ]; then
+    echo "demo: exited 0 before finishing — treating as FAILURE." >&2
+    exit 70
+  fi
+  exit "$s"
+}
+trap __guard_on_exit EXIT
+trap cleanup INT TERM
 
 # Tail the SSE stream in the background for the duration of the showcase.
 curl -N -fsS "${STREAM_URL}" >"${FRAMES}" 2>/dev/null &
@@ -99,3 +125,5 @@ else
     echo "[showcase] FAIL: emit_mismatch=${fail}, generative_ui_frames=${FRAME_COUNT} (need 0 mismatches and >=6 frames)." >&2
     exit 1
 fi
+
+finish 0
