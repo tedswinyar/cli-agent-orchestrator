@@ -29,7 +29,7 @@ def test_launch_syncs_backend_from_server_before_attach():
     call_order = []
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
@@ -63,7 +63,7 @@ def test_launch_headless_does_not_sync_backend():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
     ):
         mock_post.return_value.json.return_value = {
@@ -84,7 +84,7 @@ def test_launch_passes_cwd_by_default():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -112,7 +112,7 @@ def test_launch_passes_explicit_working_directory():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -146,7 +146,7 @@ def test_launch_passes_explicit_kiro_engine():
     """The direct CLI surface forwards engine selection without changing provider selection."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
             "id": "test-terminal-id",
@@ -174,8 +174,8 @@ def test_launch_headless_message_sends_to_terminal():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -235,7 +235,7 @@ def test_launch_with_session_name():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -263,7 +263,7 @@ def test_launch_request_exception():
     """Test launch handles RequestException."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         import requests
 
         mock_post.side_effect = requests.exceptions.RequestException("Connection refused")
@@ -278,7 +278,7 @@ def test_launch_generic_exception():
     """Test launch handles generic exception."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         mock_post.side_effect = Exception("Unexpected error")
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
@@ -292,7 +292,7 @@ def test_launch_headless_mode():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
     ):
         mock_post.return_value.json.return_value = {
@@ -320,7 +320,7 @@ def test_launch_non_headless_waits_for_idle_before_attach():
     call_order = []
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -359,7 +359,7 @@ def test_launch_non_headless_attaches_even_if_wait_times_out():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -399,7 +399,7 @@ def test_readiness_poll_accepts_waiting_user_answer():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
@@ -435,7 +435,7 @@ def test_launch_tells_the_operator_when_the_pane_awaits_an_answer():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
@@ -463,7 +463,7 @@ def test_launch_stays_quiet_when_the_terminal_settles_idle():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
@@ -487,7 +487,7 @@ def test_launch_stays_quiet_when_the_terminal_settles_idle():
 
 def test_is_waiting_on_user_reads_the_live_status():
     """True only for WAITING_USER_ANSWER."""
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
         mock_get.return_value.status_code = 200
         mock_get.return_value.json.return_value = {
             "status": TerminalStatus.WAITING_USER_ANSWER.value
@@ -507,7 +507,7 @@ def test_is_waiting_on_user_swallows_transport_errors():
     """
     import requests as _requests
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
         mock_get.side_effect = _requests.exceptions.ConnectionError("boom")
         assert _is_waiting_on_user("t1") is False
 
@@ -520,7 +520,7 @@ def test_is_waiting_on_user_ignores_a_non_200_even_with_a_waiting_body(status_co
     isinstance guard alone, so deleting the status check would not fail any test.
     A concrete waiting body is what makes the status check the thing under test.
     """
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
         mock_get.return_value.status_code = status_code
         mock_get.return_value.json.return_value = {
             "status": TerminalStatus.WAITING_USER_ANSWER.value
@@ -539,7 +539,7 @@ def test_is_waiting_on_user_survives_a_200_that_is_not_a_json_object(payload):
     except exists to prevent. Parametrized because each JSON scalar type reaches
     ``.get`` by a different route.
     """
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
         mock_get.return_value.status_code = 200
         mock_get.return_value.json.return_value = payload
         assert _is_waiting_on_user("t1") is False
@@ -550,7 +550,7 @@ def test_launch_workspace_confirmation_accepted():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -592,7 +592,7 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -617,7 +617,7 @@ def test_launch_workspace_confirmation_for_default_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -639,7 +639,7 @@ def test_launch_yolo_sets_unrestricted_allowed_tools():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -664,7 +664,7 @@ def test_launch_allowed_tools_override():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -698,7 +698,7 @@ def test_launch_builtin_profile_resolves_role_defaults():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -733,8 +733,8 @@ def test_launch_headless_message_does_not_gate_delivery_on_client_readiness():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -774,8 +774,8 @@ def test_launch_headless_message_poll_error_status():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -811,8 +811,8 @@ def test_launch_headless_message_poll_processing_then_completed():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -857,7 +857,7 @@ def test_launch_honors_profile_provider_when_flag_not_given():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -894,7 +894,7 @@ def test_launch_yolo_still_resolves_profile_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
@@ -925,7 +925,7 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -965,7 +965,7 @@ def test_launch_explicit_provider_skips_profile_resolution():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.utils.agent_profiles.resolve_provider") as mock_resolve,
@@ -997,7 +997,7 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
@@ -1105,7 +1105,7 @@ def test_launch_forwards_env_in_json_body_not_url():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -1150,7 +1150,7 @@ def test_launch_without_env_omits_request_body():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -1174,7 +1174,7 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
     silent server-side drop."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         result = runner.invoke(
             launch,
             ["--agents", "test-agent", "--yolo", "--env", "CLAUDE_SESSION_ID=abc"],
@@ -1188,7 +1188,7 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
 def test_launch_omp_requires_workspace_confirmation():
     runner = CliRunner()
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -1251,8 +1251,8 @@ def test_launch_create_call_keeps_mcp_request_timeout():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
     ):
         mock_settings.return_value = {"mcp_request_timeout": 30}
@@ -1283,8 +1283,8 @@ def test_launch_headless_message_travels_in_body_not_query_string():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
     ):
         mock_post.return_value = _create_session_response()
 
@@ -1312,8 +1312,8 @@ def test_launch_headless_message_shares_body_with_forwarded_env():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
     ):
         mock_post.return_value = _create_session_response()
 
@@ -1351,8 +1351,8 @@ def test_launch_async_returns_without_sending_input():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
     ):
@@ -1378,7 +1378,7 @@ def test_launch_headless_no_message_omits_initial_message():
     UNKNOWN instead of IDLE to a caller that expects a ready terminal."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         mock_post.return_value = _create_session_response()
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
@@ -1398,7 +1398,7 @@ def test_launch_non_headless_does_not_defer_init():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
@@ -1423,8 +1423,8 @@ def test_launch_headless_poll_budget_covers_server_side_init():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
     ):
         mock_post.return_value = _create_session_response()
