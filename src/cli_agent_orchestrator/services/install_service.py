@@ -43,6 +43,11 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.profile_store import write_profile
+from cli_agent_orchestrator.services.profile_validator import (
+    PROFILE_INSTALL_ACTION,
+    OpsAdmissionRefused,
+    admit_profile,
+)
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
@@ -93,6 +98,9 @@ class InstallResult(BaseModel):
     unresolved_vars: Optional[List[str]] = None
     source_kind: Optional[Literal["url", "file", "name"]] = None
     provider: Optional[str] = None
+    # Admission warnings an install proceeded past (warn mode). Also appended to
+    # ``message`` so every surface (CLI, HTTP, ops MCP) shows them unchanged.
+    warnings: Optional[List[str]] = None
 
 
 # Profile names are used as filesystem path segments under LOCAL_AGENT_STORE_DIR
@@ -1779,6 +1787,30 @@ def install_agent(
         if agent_profiles.routes_to_ephemeral_store(profile.name):
             raise FileNotFoundError(f"Reserved ephemeral profile name: {profile.name}")
 
+        # Control-plane admission: a profile that pairs ``cao-ops-mcp-server``
+        # with a restricted allowlist and no explicit operator grant is refused
+        # under CAO_PRINCIPAL_ENFORCE, and installed with a visible warning plus
+        # an audit line otherwise. Checked on the profile's OWN ``mcpServers``,
+        # before the plugin merge below: plugin-delivered servers are never
+        # auto-granted (test_no_auto_grant.py) and are the call-time gate's job.
+        # Runs before any write, so a refusal leaves the store byte-identical.
+        try:
+            ops_warning = admit_profile(
+                profile.name,
+                profile.mcpServers,
+                profile.allowedTools,
+                profile.role,
+                action=PROFILE_INSTALL_ACTION,
+            )
+        except OpsAdmissionRefused as exc:
+            return InstallResult(
+                success=False,
+                message=str(exc),
+                agent_name=profile.name,
+                source_kind=source_kind,
+            )
+        install_warnings: List[str] = [ops_warning] if ops_warning else []
+
         # No explicit provider — honour the profile's frontmatter ``provider:``
         # key, mirroring resolve_provider() on the launch/handoff paths. Bogus
         # frontmatter values warn and fall back to the default; built-in store
@@ -2056,15 +2088,19 @@ def install_agent(
                 allowed_tools=allowed_tools,
             )
 
+        message = f"Agent '{profile.name}' installed successfully"
+        if install_warnings:
+            message += ". WARNING: " + " ".join(install_warnings)
         return InstallResult(
             success=True,
-            message=f"Agent '{profile.name}' installed successfully",
+            message=message,
             agent_name=profile.name,
             context_file=str(context_file),
             agent_file=str(agent_file) if agent_file else None,
             unresolved_vars=unresolved_vars or None,
             source_kind=source_kind,
             provider=provider,
+            warnings=install_warnings or None,
         )
 
     except requests.RequestException as exc:

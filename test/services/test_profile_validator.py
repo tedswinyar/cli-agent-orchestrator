@@ -957,3 +957,263 @@ print(json.dumps([
             "message": _OMISSION_MESSAGE,
             "path": None,
         }
+
+
+class TestOpsAdmission:
+    """``cao-ops-mcp-server`` admission: detection, the grant, and the finding.
+
+    The rule is pure over three frontmatter fields so every surface (install,
+    launch loader, ``cao profile validate``) asks the same question.
+    """
+
+    OPS = "cao-ops-mcp-server"
+
+    # --- detection: full server name, by key or by launching command -------------
+
+    @pytest.mark.parametrize(
+        "mcp_servers, expected",
+        [
+            pytest.param(
+                {"cao-ops-mcp-server": {"command": "anything"}},
+                ("cao-ops-mcp-server",),
+                id="exact-key",
+            ),
+            pytest.param(
+                {"cao-ops-mcp-server-v2": {"command": "other"}}, (), id="key-prefix-is-not-a-match"
+            ),
+            pytest.param(
+                {"cao-mcp-server": {"command": "cao-mcp-server"}},
+                (),
+                id="in-session-server-untouched",
+            ),
+            pytest.param(
+                {"ops": {"command": "cao-ops-mcp-server"}}, ("ops",), id="bare-console-script"
+            ),
+            pytest.param(
+                {"ops": {"command": "/opt/venv/bin/cao-ops-mcp-server"}},
+                ("ops",),
+                id="absolute-path",
+            ),
+            pytest.param(
+                {"ops": {"command": "C:\\venv\\Scripts\\cao-ops-mcp-server.exe"}},
+                ("ops",),
+                id="windows-exe",
+            ),
+            pytest.param(
+                {
+                    "ops": {
+                        "command": "uvx",
+                        "args": [
+                            "--from",
+                            "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                            "cao-ops-mcp-server",
+                        ],
+                    }
+                },
+                ("ops",),
+                id="uvx-git-form-from-docs",
+            ),
+            pytest.param(
+                {
+                    "cao-ops": {
+                        "command": "uvx",
+                        "args": ["--from", "cli-agent-orchestrator==2.5.3", "cao-ops-mcp-server"],
+                    }
+                },
+                ("cao-ops",),
+                id="uvx-pinned-form-from-operator-plugin",
+            ),
+            pytest.param(
+                {"ops": {"command": "uv", "args": ["run", "cao-ops-mcp-server"]}},
+                ("ops",),
+                id="uv-run",
+            ),
+            pytest.param(
+                {
+                    "ops": {
+                        "command": "pipx",
+                        "args": ["run", "--spec", "cli-agent-orchestrator", "cao-ops-mcp-server"],
+                    }
+                },
+                ("ops",),
+                id="pipx-run",
+            ),
+            pytest.param(
+                {
+                    "ops": {
+                        "command": "python",
+                        "args": ["-m", "cli_agent_orchestrator.ops_mcp_server.server"],
+                    }
+                },
+                ("ops",),
+                id="python-module",
+            ),
+            pytest.param(
+                {"ops": {"command": "sh", "args": ["-c", "exec cao-ops-mcp-server"]}},
+                ("ops",),
+                id="shell-wrapper",
+            ),
+            pytest.param(
+                {"ops": {"command": "uvx", "args": ["--from", "x", "cao-ops-mcp-server-extra"]}},
+                (),
+                id="arg-prefix-is-not-a-match",
+            ),
+            pytest.param(
+                {"ops": {"command": "uvx", "args": ["--from", "x", "cao-mcp-server"]}},
+                (),
+                id="arg-in-session-server",
+            ),
+            pytest.param(
+                {"ops": {"type": "http", "url": "https://example.test/cao-ops-mcp-server"}},
+                (),
+                id="remote-url-is-never-the-ops-server",
+            ),
+            pytest.param({"ops": "cao-ops-mcp-server"}, (), id="non-mapping-entry"),
+            pytest.param(
+                {"a": {"command": "cao-ops-mcp-server"}, "b": {"command": "cao-ops-mcp-server"}},
+                ("a", "b"),
+                id="two-entries-both-named",
+            ),
+            pytest.param(None, (), id="no-mcpServers"),
+            pytest.param(["cao-ops-mcp-server"], (), id="non-mapping-mcpServers"),
+        ],
+    )
+    def test_ops_server_entries(self, mcp_servers, expected) -> None:
+        assert profile_validator.ops_server_entries(mcp_servers) == expected
+
+    def test_server_name_matches_authz_constant(self) -> None:
+        from cli_agent_orchestrator.security.authz import CAO_OPS_MCP_SERVER
+
+        assert profile_validator.OPS_MCP_SERVER_NAME == CAO_OPS_MCP_SERVER
+        assert profile_validator.OPS_GRANT == f"@{CAO_OPS_MCP_SERVER}"
+
+    def test_module_constant_matches_console_script_entry_point(self) -> None:
+        import re
+        from pathlib import Path
+
+        pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
+        match = re.search(r'^"cao-ops-mcp-server"\s*=\s*"([^:"]+):', pyproject, re.MULTILINE)
+        assert match, "pyproject.toml no longer registers cao-ops-mcp-server"
+        assert match.group(1) == profile_validator.OPS_MCP_SERVER_MODULE
+
+    # --- the grant: explicit selector, per-tool selector, or unrestricted --------
+
+    @pytest.mark.parametrize(
+        "allowed, role, expected",
+        [
+            pytest.param(["fs_read", "@cao-ops-mcp-server"], None, True, id="server-selector"),
+            pytest.param(["@cao-ops-mcp-server/list_sessions"], None, True, id="per-tool-selector"),
+            pytest.param(["*"], None, True, id="unrestricted"),
+            pytest.param(
+                ["@cao-ops-mcp-server"], "reviewer", True, id="explicit-list-outranks-role"
+            ),
+            pytest.param(["@cao-*"], None, False, id="glob-is-not-a-grant"),
+            pytest.param(["@cao-ops-mcp-server/"], None, False, id="empty-tool-selector"),
+            pytest.param(["@cao-mcp-server"], None, False, id="in-session-selector"),
+            pytest.param([], None, False, id="empty-allowlist"),
+            pytest.param(None, "developer", False, id="role-developer"),
+            pytest.param(None, "supervisor", False, id="role-supervisor"),
+            pytest.param(None, "reviewer", False, id="role-reviewer"),
+            pytest.param(None, "workflow_scout", False, id="role-workflow-scout"),
+            pytest.param(None, None, False, id="defaults"),
+            pytest.param(None, "no-such-role", False, id="unknown-role"),
+            pytest.param("@cao-ops-mcp-server", None, False, id="allowedTools-not-a-list"),
+            pytest.param(None, ["developer"], False, id="role-not-a-string"),
+        ],
+    )
+    def test_ops_grant_present(self, allowed, role, expected, monkeypatch) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(settings_service, "_load", lambda: {})
+        assert profile_validator.ops_grant_present(allowed, role) is expected
+
+    def test_settings_role_carrying_the_selector_is_a_grant(self, monkeypatch) -> None:
+        """A role-shaped grant exists without a new keyword: define it in settings.json."""
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(
+            settings_service,
+            "_load",
+            lambda: {"agents": {"roles": {"operator": ["fs_read", "@cao-ops-mcp-server"]}}},
+        )
+        assert profile_validator.ops_grant_present(None, "operator") is True
+
+    def test_grant_check_never_appends_declared_servers(self, monkeypatch) -> None:
+        """Declaring the server must not count as granting it (the auto-grant)."""
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(settings_service, "_load", lambda: {})
+        admission = profile_validator.check_ops_admission(
+            {"cao-ops-mcp-server": {"command": "cao-ops-mcp-server"}}, None, "developer"
+        )
+        assert admission.named_by == ("cao-ops-mcp-server",)
+        assert admission.granted is False
+        assert admission.violates is True
+
+    def test_profile_without_the_server_does_not_resolve_roles(self, monkeypatch) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        def _boom():
+            raise AssertionError("settings read for a profile that never named the server")
+
+        monkeypatch.setattr(settings_service, "_load", _boom)
+        admission = profile_validator.check_ops_admission(
+            {"cao-mcp-server": {"command": "cao-mcp-server"}}, None, "developer"
+        )
+        assert admission.violates is False
+        assert admission.names_ops_server is False
+
+    # --- the validator finding ---------------------------------------------------
+
+    def _violating(self) -> dict:
+        return {
+            "name": "ops-worker",
+            "description": "d",
+            "role": "developer",
+            "mcpServers": {"cao-ops-mcp-server": {"command": "cao-ops-mcp-server"}},
+        }
+
+    def test_validate_reports_the_pairing_as_a_warning_in_warn_mode(self, monkeypatch) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(settings_service, "_load", lambda: {})
+        monkeypatch.delenv("CAO_PRINCIPAL_ENFORCE", raising=False)
+        findings = validate_frontmatter(self._violating())
+        [finding] = [f for f in findings if f.path == "mcpServers"]
+        assert finding.severity == "warning"
+        assert finding.message == profile_validator.ops_admission_message(
+            "ops-worker", profile_validator.OpsAdmission(("cao-ops-mcp-server",), False)
+        )
+
+    def test_validate_reports_the_pairing_as_an_error_when_enforcing(self, monkeypatch) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(settings_service, "_load", lambda: {})
+        monkeypatch.setenv("CAO_PRINCIPAL_ENFORCE", "1")
+        findings = validate_frontmatter(self._violating())
+        [finding] = [f for f in findings if f.path == "mcpServers"]
+        assert finding.severity == "error"
+        assert "Profile 'ops-worker'" in finding.message
+        assert "'@cao-ops-mcp-server'" in finding.message
+
+    def test_validate_is_clean_with_the_grant_and_does_not_warn_about_its_vocabulary(
+        self, monkeypatch
+    ) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(settings_service, "_load", lambda: {})
+        monkeypatch.setenv("CAO_PRINCIPAL_ENFORCE", "1")
+        meta = self._violating()
+        meta["allowedTools"] = ["fs_read", "@cao-ops-mcp-server"]
+        assert validate_frontmatter(meta) == []
+
+    def test_validate_unnamed_profile_message_has_no_quoted_none(self, monkeypatch) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        monkeypatch.setattr(settings_service, "_load", lambda: {})
+        meta = self._violating()
+        del meta["name"]
+        findings = validate_frontmatter(meta)
+        [finding] = [f for f in findings if f.path == "mcpServers"]
+        assert finding.message.startswith("This profile pairs")
+        assert "None" not in finding.message

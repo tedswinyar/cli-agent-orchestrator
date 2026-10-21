@@ -103,6 +103,29 @@ Launch-time options can then alter those resolved restrictions.
 See [Tool Restrictions](tool-restrictions.md) for built-in roles, the tool
 vocabulary, launch overrides, provider enforcement, and limitations.
 
+### Control-plane grant: `@cao-ops-mcp-server`
+
+A profile whose `mcpServers` names `cao-ops-mcp-server` (by that exact key, or
+by any entry whose command launches it, such as `uvx --from <pkg>
+cao-ops-mcp-server`) must grant it explicitly, because that server controls the
+whole fleet rather than one session. The grant is an `allowedTools` entry in the
+ordinary selector grammar:
+
+```yaml
+allowedTools:
+  - fs_read
+  - "@cao-ops-mcp-server"          # or "@cao-ops-mcp-server/list_sessions"
+mcpServers:
+  cao-ops-mcp-server:
+    command: cao-ops-mcp-server
+```
+
+No built-in `role` carries this grant, and a glob such as `@cao-*` does not
+count; an unrestricted `*` does. Without the grant, `cao install` warns (and,
+with `CAO_PRINCIPAL_ENFORCE=1`, refuses), the launch loader re-checks the file
+on disk, and `cao profile validate` reports the pairing. See
+[Control planes](control-planes.md#admission-rule-for-agent-profiles-experimental).
+
 ## Provider selection and precedence
 
 Provider selection depends on the operation:

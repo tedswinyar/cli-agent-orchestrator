@@ -40,10 +40,44 @@ def routes_to_ephemeral_store(name: str) -> bool:
     return _RESERVED_EPHEMERAL_PATTERN.fullmatch(name) is not None
 
 
+def _admit_launch_profile(profile: AgentProfile) -> None:
+    """Re-apply the ``cao-ops-mcp-server`` admission rule at launch.
+
+    ``install_agent`` applies it at configuration time, but a hand-edited store
+    file or a profile installed before the rule existed never passed through
+    that check, so the launch loader asks the same question of what is on disk
+    now. Under ``CAO_PRINCIPAL_ENFORCE`` a violating profile raises
+    :class:`services.profile_validator.OpsAdmissionRefused` (a ``ValueError``)
+    and the launch fails closed; otherwise the loader warns and audits. The
+    read-only loader :func:`load_agent_profile` is left alone so an operator
+    can still inspect the profile they need to fix. The call-time gate in
+    ``security.authz`` remains the last line for a profile already running.
+    """
+    from cli_agent_orchestrator.services.profile_validator import (
+        PROFILE_LOAD_ACTION,
+        admit_profile,
+    )
+
+    admit_profile(
+        profile.name,
+        profile.mcpServers,
+        profile.allowedTools,
+        profile.role,
+        action=PROFILE_LOAD_ACTION,
+    )
+
+
 def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
-    """Load a launch profile; reserved names never fall back to installed stores."""
+    """Load a launch profile; reserved names never fall back to installed stores.
+
+    Every launch path resolves its profile here, so this is also where the
+    ``cao-ops-mcp-server`` admission rule is re-checked (see
+    :func:`_admit_launch_profile`).
+    """
     if not routes_to_ephemeral_store(name):
-        return load_agent_profile(name), ProfileSource.INSTALLED
+        profile = load_agent_profile(name)
+        _admit_launch_profile(profile)
+        return profile, ProfileSource.INSTALLED
     try:
         path = _safe_join(EPHEMERAL_LIVE_DIR, f"{name}.md")
         if path is None:
@@ -61,6 +95,7 @@ def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
             os.close(fd)
     except Exception as exc:
         raise EphemeralProfileUnavailable(f"Ephemeral profile unavailable: {name}") from exc
+    _admit_launch_profile(profile)
     return profile, ProfileSource.EPHEMERAL
 
 
@@ -477,11 +512,14 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     Returns:
         Resolved provider type string.
     """
+    from cli_agent_orchestrator.services.profile_validator import OpsAdmissionRefused
+
     try:
         profile, _source = load_launch_profile(agent_profile_name)
-    except (FileNotFoundError, RuntimeError):
-        # Profile not found or failed to load — provider.initialize()
-        # will surface a clear error later.  Fall back for now.
+    except (FileNotFoundError, RuntimeError, OpsAdmissionRefused):
+        # Profile not found, failed to load, or refused by the ops admission
+        # rule — provider.initialize() / create_terminal will surface a clear
+        # error later.  Fall back for now.
         return fallback_provider
 
     if profile.provider:
