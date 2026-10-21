@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.security.agent_credential import agent_credential
 from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.utils.orchestration import _is_local_api, _mcp_timeout
 
@@ -21,19 +22,19 @@ logger = logging.getLogger(__name__)
 def _auth_headers() -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal MCP->API hop, if any.
 
-    Mirrors ``app_tools._auth_headers``: attaches the operator-provisioned
-    ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is enabled, and returns an empty
-    mapping default-off so the no-auth posture is byte-for-byte unchanged. Reads
-    are not scope-gated today, but the header is attached for consistency so the
-    whole MCP->API hop behaves the same with auth on.
+    Thin alias over :func:`security.agent_credential.agent_credential` (#965):
+    the per-terminal ``CAO_TERMINAL_TOKEN`` when CAO launched this process,
+    else the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer
+    is enabled, else an empty mapping so the default-off posture is
+    byte-for-byte unchanged. The module-level ``get_local_bearer`` is passed
+    explicitly so tests that patch it here keep steering the fallback.
 
     For requests to ``API_BASE_URL`` only. A call whose base URL came from a
     ``target_host`` argument goes through ``_auth_headers_for(base_url)`` so the
-    token is never sent to another node.
+    credential is never sent to another node.
     """
 
-    token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return agent_credential(operator_bearer=get_local_bearer)
 
 
 def _auth_headers_for(base_url: str) -> Dict[str, str]:

@@ -41,10 +41,38 @@ agents only.
 
 `mint_terminal_credential()` returns `(token, digest)`. The token is
 `cao_t_` plus 43 URL-safe characters (256 bits). Only the digest is stored, so
-a database read never yields a usable bearer. Wiring the mint into
-`create_terminal` and the agent environment is a separate workstream; this
-module provides the storage (`set_terminal_credential_digest`), the lookup
-(`get_terminal_by_credential_digest`) and the resolution.
+a database read never yields a usable bearer.
+
+**Minted at create.** `services.terminal_service.create_terminal` mints the
+credential before the backend creates the pane and places the token in the
+pane's environment as `CAO_TERMINAL_TOKEN`, next to `CAO_TERMINAL_ID`, on both
+backends: tmux (`create_session` / `create_window` / pane split, via the same
+`extra_env` channel as `cao launch --env`) and herdr (`--env` at create). The
+token is assigned last in that mapping, so neither an operator `--env` nor a
+persisted session var can hand a window a sibling's credential, and it is
+never written to the session-env store. The digest travels in the row
+INSERT itself (`create_terminal(..., credential_digest=...)`), so no
+committed row ever exists whose token nothing resolves. Every terminal gets
+its own, including the memory sidecar from `cao launch --memory`.
+
+**Presented on every hop.** `security.agent_credential.agent_credential()`
+is the one helper behind every agent->API request: it prefers
+`CAO_TERMINAL_TOKEN`, falls back to the operator token path
+(`CAO_AUTH_LOCAL_TOKEN`) exactly as before, and returns `{}` when neither is
+set so default-off is byte-for-byte unchanged. The old `_auth_headers()`
+names in `mcp_server/utils.py`, `mcp_server/app_tools.py` and
+`utils/orchestration.py` are thin aliases over it, which is how the
+`cao agent ...` commands present the token too.
+`test/security/test_agent_credential_guard.py` walks every `requests` call to
+`API_BASE_URL` in those modules and fails, with file and line, on any that
+does not take its headers from the helper (the #990 class).
+
+**Revoked on close.** `delete_terminal` clears the digest before the runtime
+teardown runs, so the token stops resolving even when the kill is deferred for
+a retry; row removal (single-terminal and session teardown alike) is the
+backstop, because a missing row is already "revoked" to the resolver. The
+`cao_t_` path answers 401 `terminal credential revoked` regardless of
+`CAO_PRINCIPAL_ENFORCE`: it is a credential check, not a policy decision.
 
 ## Actions and rules
 

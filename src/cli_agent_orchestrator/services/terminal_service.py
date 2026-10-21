@@ -57,6 +57,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    set_terminal_credential_digest,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
@@ -105,6 +106,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
+from cli_agent_orchestrator.security.agent_credential import TERMINAL_TOKEN_ENV
+from cli_agent_orchestrator.security.principal import mint_terminal_credential
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
@@ -1734,6 +1737,14 @@ async def _create_terminal_unguarded(
             """
             nonlocal deferred_delete_on_failure, session_incarnation_id, created_terminal_facts
             assert session_name is not None  # narrowed by the caller
+            # Mint this terminal's credential (#965) BEFORE the backend create:
+            # the token has to be in the pane's environment from its first
+            # process, next to CAO_TERMINAL_ID, and the backend create is the
+            # only moment that environment is set. Only the digest is stored
+            # (in the row INSERT below, so a committed row always resolves its
+            # token); the token itself never touches the database, the
+            # session-env store or a log line.
+            credential_token, credential_digest = mint_terminal_credential()
             with session_lifecycle_lock(session_name):
                 if new_session:
                     # Prevent duplicate sessions
@@ -1749,12 +1760,13 @@ async def _create_terminal_unguarded(
 
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
+                    effective_env[TERMINAL_TOKEN_ENV] = credential_token
                     get_backend().create_session(
                         session_name,
                         window_name,
                         terminal_id,
                         resolved_working_directory,
-                        extra_env=effective_env or None,
+                        extra_env=effective_env,
                     )
                     created_window_name = window_name
                     created_session, created_window = True, False
@@ -1777,6 +1789,9 @@ async def _create_terminal_unguarded(
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
                     # joins an existing session (issue #408).
                     effective_env = {**get_session_env(session_name), **(env_vars or {})}
+                    # Assigned LAST so neither a persisted session var nor a
+                    # per-step one can hand this window a sibling's credential.
+                    effective_env[TERMINAL_TOKEN_ENV] = credential_token
                     created_window_name = get_backend().create_window(
                         session_name,
                         window_name,
@@ -1846,6 +1861,7 @@ async def _create_terminal_unguarded(
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
+                        credential_digest=credential_digest,
                         # The initial message is ACCEPTED the moment this row is
                         # visible, so its outcome starts life as pending in the same
                         # transaction (#566): a restart between here and the deferred
@@ -4768,6 +4784,14 @@ def delete_terminal_row(
     return deleted
 
 
+def _revoke_terminal_credential(terminal_id: str) -> None:
+    """Clear a terminal's credential digest so its token stops resolving (#965)."""
+    try:
+        set_terminal_credential_digest(terminal_id, None)
+    except Exception as exc:  # noqa: BLE001 -- row removal is the backstop
+        logger.warning("Could not revoke credential for terminal %s: %s", terminal_id, exc)
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -4780,6 +4804,14 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     """
     try:
         metadata = capture_terminal_snapshot(terminal_id)
+        # Revoke the terminal's credential (#965) BEFORE the runtime teardown
+        # runs: from this point the agent is being killed, and whether the kill
+        # is proven now or on a deferred retry its token must stop resolving.
+        # Best-effort: a database hiccup here must not leave the teardown
+        # half-done. Row removal below (and in session teardown, which never
+        # calls this) is the backstop -- a missing row is "revoked" to the
+        # resolver too.
+        _revoke_terminal_credential(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id

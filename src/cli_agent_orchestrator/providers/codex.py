@@ -1585,9 +1585,13 @@ class CodexProvider(BaseProvider):
                     # can identify the current session for handoff/assign operations.
                     # Codex does not forward env vars to MCP subprocesses by default;
                     # env_vars lists names to inherit from the parent shell environment.
+                    # CAO_TERMINAL_TOKEN (#965) rides along the same way: a NAME
+                    # to inherit, so the credential is never written into the
+                    # generated config.
                     env_vars = cfg.get("env_vars", [])
-                    if "CAO_TERMINAL_ID" not in env_vars:
-                        env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
+                    for forwarded in ("CAO_TERMINAL_ID", "CAO_TERMINAL_TOKEN"):
+                        if forwarded not in env_vars:
+                            env_vars = list(env_vars) + [forwarded]
                     env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which

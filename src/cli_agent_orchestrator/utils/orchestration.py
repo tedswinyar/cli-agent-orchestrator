@@ -43,6 +43,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.security.agent_credential import agent_credential
 from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
@@ -79,9 +80,13 @@ def _auth_headers() -> Dict[str, str]:
     surface (assign, handoff, send_message, status, result, cancel, delete_terminal)
     cannot be used at all. Calls whose base URL may be another node go through
     ``_auth_headers_for(base_url)`` so the token never leaves this node.
+
+    Since #965 this is a thin alias over
+    :func:`security.agent_credential.agent_credential`: inside a CAO terminal
+    the per-terminal ``CAO_TERMINAL_TOKEN`` wins, so ``cao agent ...`` and the
+    MCP tools present the terminal's own identity rather than the operator's.
     """
-    token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return agent_credential(operator_bearer=get_local_bearer)
 
 
 def _is_local_api(base_url: str) -> bool:
