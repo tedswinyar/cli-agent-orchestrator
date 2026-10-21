@@ -33,6 +33,8 @@ from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
+from cli_agent_orchestrator.security import tool_gate
+from cli_agent_orchestrator.security.authz import CAO_MCP_SERVER
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
@@ -89,6 +91,30 @@ mcp = FastMCP(
     - Ensure you're running within a CAO terminal (CAO_TERMINAL_ID must be set)
     """,
 )
+
+# Every ``@mcp.tool`` registration in this module stacks ``@_gated`` directly under
+# it, so the object FastMCP registers is the gated wrapper and no tool is reachable
+# without ``_tool_denied_reason`` (#671). ``test/security/test_tool_gate_census.py``
+# fails with file:line for any registration that lacks it. The lambda resolves
+# ``_tool_denied_reason`` by name at call time so tests that monkeypatch it hold.
+_gated = tool_gate.gated(lambda name: _tool_denied_reason(name), server=CAO_MCP_SERVER)
+
+
+def _handoff_refusal(reason: str) -> HandoffResult:
+    return HandoffResult(success=False, message=reason, output=None, terminal_id=None)
+
+
+def _assign_refusal(reason: str) -> Dict[str, Any]:
+    return {"success": False, "error": reason}
+
+
+def _assign_elastic_refusal(reason: str) -> Dict[str, Any]:
+    return {"success": False, "terminal_id": None, "elastic": True, "message": reason}
+
+
+def _workflow_refusal(reason: str) -> Dict[str, Any]:
+    return {"ok": False, "error": reason}
+
 
 LOAD_SKILL_TOOL_DESCRIPTION = """Retrieve the full Markdown body of an available skill from cao-server.
 
@@ -324,6 +350,7 @@ _model_field_desc = (
 if ENABLE_WORKING_DIRECTORY:
 
     @mcp.tool()
+    @_gated(refuse=_handoff_refusal)
     async def handoff(
         agent_profile: str = Field(
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
@@ -427,9 +454,6 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        denied = _tool_denied_reason("handoff")
-        if denied:
-            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -445,6 +469,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool()
+    @_gated(refuse=_handoff_refusal)
     async def handoff(  # type: ignore[misc]
         agent_profile: str = Field(
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
@@ -531,9 +556,6 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        denied = _tool_denied_reason("handoff")
-        if denied:
-            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -634,6 +656,7 @@ _assign_message_field_desc = (
 if ENABLE_WORKING_DIRECTORY:
 
     @mcp.tool(description=_assign_description)
+    @_gated(refuse=_assign_refusal)
     async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
@@ -665,9 +688,6 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ] = None,
     ) -> Dict[str, Any]:
-        denied = _tool_denied_reason("assign")
-        if denied:
-            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -682,6 +702,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool(description=_assign_description)
+    @_gated(refuse=_assign_refusal)
     async def assign(  # type: ignore[misc]
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
@@ -710,9 +731,6 @@ else:
             ),
         ] = None,
     ) -> Dict[str, Any]:
-        denied = _tool_denied_reason("assign")
-        if denied:
-            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -768,6 +786,7 @@ def _release_elastic_worker(broker_url: str, broker_token: str, worker_id: str) 
 
 
 @mcp.tool()
+@_gated(refuse=_assign_elastic_refusal)
 async def assign_elastic(
     agent_profile: str = Field(
         description='Agent profile for the disposable worker (for example "developer")'
@@ -807,13 +826,8 @@ async def assign_elastic(
     arrived, and records which happened. Query ``GET /workers`` on the broker
     when a delegation reports success and produces no artifact.
     """
-    # Checked before the broker is asked for a lease, so a refused caller never
-    # gets a worker provisioned on its behalf. For a bound caller this resolves
-    # the terminal context over blocking HTTP, so it runs off the event loop for
-    # the same reason as the broker POST below.
-    denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
-    if denied:
-        return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
+    # The allowlist gate (``@_gated``) ran before this body, so a refused caller
+    # never gets a worker provisioned on its behalf.
     from cli_agent_orchestrator.utils import agent_profiles
 
     if agent_profiles.routes_to_ephemeral_store(agent_profile):
@@ -917,6 +931,7 @@ async def assign_elastic(
 
 # Implementation function for send_message
 @mcp.tool()
+@_gated
 async def send_message(
     message: str = Field(description="Message content to send"),
     receiver_id: Optional[str] = Field(
@@ -952,6 +967,7 @@ async def send_message(
 
 
 @mcp.tool()
+@_gated
 async def complete_assignment(
     message: str = Field(description="Final result to deliver to the assigning supervisor"),
 ) -> Dict[str, Any]:
@@ -994,6 +1010,7 @@ async def complete_assignment(
 
 
 @mcp.tool()
+@_gated
 async def emit_ui(
     component: str = Field(
         description=(
@@ -1041,6 +1058,7 @@ async def emit_ui(
 
 
 @mcp.tool()
+@_gated
 async def answer_user_prompt(
     terminal_id: str = Field(description="Target terminal ID waiting for user input"),
     answer: str = Field(
@@ -1059,6 +1077,7 @@ async def answer_user_prompt(
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)
+@_gated
 async def load_skill(
     name: str = Field(description="Name of the skill to retrieve"),
 ) -> Any:
@@ -1067,6 +1086,7 @@ async def load_skill(
 
 
 @mcp.tool()
+@_gated
 def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
@@ -1122,6 +1142,7 @@ def delete_terminal(
 
 
 @mcp.tool()
+@_gated
 def get_handoff_result(
     job_id: str = Field(
         description=(
@@ -1336,6 +1357,7 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_gated
 async def list_siblings(
     depth: Optional[int] = Field(
         default=None,
@@ -1394,6 +1416,7 @@ async def list_siblings(
 
 
 @mcp.tool()
+@_gated
 async def update_metadata(
     metadata: Dict[str, Any] = Field(
         description=(
@@ -1429,6 +1452,7 @@ async def update_metadata(
 
 
 @mcp.tool()
+@_gated
 def find_profiles(
     query: str = Field(
         description="Free-text keywords describing the capability you need (e.g. 'monitor sqs')"
@@ -1556,50 +1580,56 @@ CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 
 
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
-    """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
+    """Reason the calling terminal may not call ``tool_name``, or None to proceed.
 
-    ``assign``, ``handoff`` and ``assign_elastic`` spawn a terminal under a
-    caller-chosen ``agent_profile``. ``workflow_run``, ``workflow_resume`` and
-    ``workflow_start`` can dispatch the same work through a workflow. An agent
-    reaching any of them can mint a new identity with its own memory scope
-    under another installed profile (#671). The
-    provider-native restrictions built by ``utils/tool_mapping`` cannot cover
-    that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
-    server references have no native tool names, so CAO's own MCP surface is
-    unreachable from that mechanism by construction.
+    The host-layer gate for every tool on ``cao-mcp-server`` (#671). Each
+    ``@mcp.tool`` registration stacks ``@_gated`` under it, which calls this
+    by name before the body runs; the decision itself comes from
+    :func:`security.authz.check` through :mod:`security.tool_gate`, never
+    from a comparison written here.
 
-    The authorization model here is the one CAO already has, not a second one.
-    The effective list is the terminal's recorded ``allowed_tools``, or the
-    profile resolution that ``None`` stands for, and these operations are
-    granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
-    Bare tool names are provider-native vocabulary and never name an MCP tool.
+    Policy (the #671 ruling): for a bound terminal, omitting ``@cao-mcp-server``
+    denies every tool on this server by default. Two exception sets stay and are
+    named in ``authz``: the worker callbacks (``send_message``,
+    ``complete_assignment``, ``workflow_return``, ``answer_user_prompt``) and the
+    discovery pair (``list_siblings``, ``update_metadata``). The per-tool form
+    ``@cao-mcp-server/<tool>`` grants one tool; a bare tool name never names an
+    MCP tool, because bare names are provider-native vocabulary.
 
-    Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
-    context (``cao assign`` and ``cao handoff`` run with no caller identity)
-    and allows. Once the caller claims an identity every failure to resolve it
-    denies: a malformed ID, an unreachable or unauthorized cao-server, a
-    terminal that is not registered, an unreadable profile.
+    Identity. The effective list is the terminal's recorded ``allowed_tools``,
+    or the profile resolution that ``None`` stands for, exactly as
+    ``create_terminal`` computes it. An unset ``CAO_TERMINAL_ID`` is the
+    supported operator context (``cao assign`` / ``cao handoff`` run with no
+    caller identity) and is never looked up. Once the caller claims an identity
+    every failure to resolve it is an unknown, and an unknown does not dispatch
+    (see ``tool_gate.unresolved`` for the warn-mode carve-out).
 
-    ``None`` from ``_get_terminal_context_from_env`` is NOT proof of an
-    operator context. That helper also returns ``None`` for a malformed
-    ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
-    error) and from its trailing ``except Exception``. So boundness is
-    established here from the environment rather than inferred from the
-    absence of an exception.
+    Enforcement. ``assign``, ``handoff``, ``assign_elastic``, ``workflow_run``,
+    ``workflow_resume`` and ``workflow_start`` were refused on main before the
+    flag existed and stay hard. Every other tool refuses only under
+    ``CAO_PRINCIPAL_ENFORCE``; in warn mode (default) ``check`` audits the
+    would-be refusal to ``CAO_HOME_DIR/logs/authz.jsonl`` and the call proceeds.
+
+    Ephemeral policy (``max_depth``, ``child_may_delegate``) is not an allowlist
+    rule and is applied here before the allowlist, unchanged.
     """
-    if not os.environ.get("CAO_TERMINAL_ID"):
+    if not tool_gate.bound_terminal_id():
         return None
 
     try:
         context = _get_terminal_context_from_env()
     except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
         logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
-        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
+        return tool_gate.unresolved(
+            tool_name,
+            f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})",
+        )
 
     if context is None:
-        return (
+        return tool_gate.unresolved(
+            tool_name,
             f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
-            "terminal could not be resolved"
+            "terminal could not be resolved",
         )
 
     if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
@@ -1625,21 +1655,20 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         allowed = _caller_effective_allowed_tools(context)
     except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
         logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
-        return (
+        return tool_gate.unresolved(
+            tool_name,
             f"cannot authorize '{tool_name}': the caller's allowed tools could not "
-            f"be resolved ({e})"
+            f"be resolved ({e})",
         )
 
     if allowed is None:
-        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+        return tool_gate.unresolved(
+            tool_name,
+            f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved",
+        )
 
-    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
-        return None
-
-    return (
-        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
-        f"include '{CAO_MCP_SERVER_SELECTOR}'"
-    )
+    principal = tool_gate.principal_for(context, allowed)
+    return tool_gate.denial_for(principal, tool_name, server=CAO_MCP_SERVER)
 
 
 async def create_ephemeral_agent(
@@ -1821,6 +1850,7 @@ _register_ephemeral_tool(mcp, _ephemeral_enabled_at_startup())
 
 
 @mcp.tool()
+@_gated
 async def memory_store(
     content: str = Field(description="Memory content to store (markdown supported)"),
     scope: str = Field(
@@ -1905,6 +1935,7 @@ async def memory_store(
 
 
 @mcp.tool()
+@_gated
 async def memory_recall(
     query: Optional[str] = Field(
         default=None,
@@ -2023,6 +2054,7 @@ async def memory_recall(
 
 
 @mcp.tool()
+@_gated
 async def memory_forget(
     key: str = Field(description="Key of the memory to remove (e.g. 'prefer-pytest')"),
     scope: str = Field(
@@ -2107,6 +2139,7 @@ def _outcome_tool_error(
 
 
 @mcp.tool()
+@_gated
 async def report_outcome(
     task_label: str = Field(
         description=(
@@ -2178,6 +2211,7 @@ async def report_outcome(
 
 
 @mcp.tool()
+@_gated
 async def list_outcomes(
     session_name: Optional[str] = Field(
         default=None,
@@ -2236,6 +2270,7 @@ async def list_outcomes(
 
 
 @mcp.tool()
+@_gated
 async def store_lesson(
     target_agent_profile: str = Field(
         description=(
@@ -2353,6 +2388,7 @@ async def store_lesson(
 
 
 @mcp.tool()
+@_gated
 async def workflow_return(
     output: Annotated[
         Dict[str, Any], Field(description="The structured JSON output for this workflow step")
@@ -2435,6 +2471,7 @@ def _workflow_default_root(explicit: object) -> Optional[str]:
 
 
 @mcp.tool()
+@_gated(refuse=_workflow_refusal)
 async def workflow_run(
     name_or_path: Annotated[
         str, Field(description="Workflow name (indexed) or path to a spec YAML file")
@@ -2487,9 +2524,6 @@ async def workflow_run(
     (``_check_run_id_available``, 409 on collision), surfaced through the envelope.
     The tool stays blocking (FR-5.2); the async ``:submit`` spine is a separate seam.
     """
-    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_run")
-    if denied:
-        return {"ok": False, "error": denied}
 
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied. ``isinstance(..., str)``
@@ -2532,6 +2566,7 @@ async def workflow_run(
 
 
 @mcp.tool()
+@_gated(refuse=_workflow_refusal)
 async def workflow_resume(
     run_id: Annotated[str, Field(description="The run id to resume (a crashed/failed prior run)")],
     decisions: Annotated[
@@ -2578,9 +2613,6 @@ async def workflow_resume(
     values. The tool's contract is otherwise unchanged: a 400 from the route is still
     just another ``ok=False`` detail.
     """
-    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_resume")
-    if denied:
-        return {"ok": False, "error": denied}
 
     # ``decisions`` arrives as a real dict from an MCP client (fastmcp resolves the
     # declared default through the generated model) and as the ``FieldInfo`` SENTINEL
@@ -2626,6 +2658,7 @@ async def workflow_resume(
 
 
 @mcp.tool()
+@_gated
 async def workflow_cancel(
     run_id: Annotated[str, Field(description="The run id to cancel (from a prior workflow_run)")],
 ) -> Dict[str, Any]:
@@ -2662,6 +2695,7 @@ async def workflow_cancel(
 # blocking path only). ``workflow_wait`` bounds only its OVERALL wait long.
 # ---------------------------------------------------------------------------
 @mcp.tool()
+@_gated(refuse=_workflow_refusal)
 async def workflow_start(
     name_or_path: Annotated[
         str, Field(description="Workflow name (indexed) or path to a spec YAML file")
@@ -2704,9 +2738,6 @@ async def workflow_start(
     blocking tool); admission (uniqueness) is the server's and a collision surfaces
     as ``ok=False``.
     """
-    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_start")
-    if denied:
-        return {"ok": False, "error": denied}
 
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied — ``isinstance(..., str)``
@@ -2746,6 +2777,7 @@ async def workflow_start(
 
 
 @mcp.tool()
+@_gated
 async def workflow_plan_approval(
     run_id: Annotated[
         str, Field(description="The run id to report on (from workflow_start / workflow_run)")
@@ -2809,6 +2841,7 @@ async def workflow_plan_approval(
 
 
 @mcp.tool()
+@_gated
 async def workflow_status(
     run_id: Annotated[
         str, Field(description="The run id to snapshot (from workflow_start / workflow_run)")
@@ -2844,6 +2877,7 @@ async def workflow_status(
 
 
 @mcp.tool()
+@_gated
 async def workflow_result(
     run_id: Annotated[str, Field(description="The run id whose retained result to fetch")],
 ) -> Dict[str, Any]:
@@ -2889,6 +2923,7 @@ async def workflow_result(
 
 
 @mcp.tool()
+@_gated
 async def workflow_list(
     state: Annotated[
         Optional[str],
@@ -2923,6 +2958,7 @@ async def workflow_list(
 
 
 @mcp.tool()
+@_gated
 async def workflow_wait(
     run_id: Annotated[
         str, Field(description="The run id to follow until it reaches a terminal state")
@@ -3035,6 +3071,7 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
 
 
 @mcp.tool()
+@_gated
 async def workflow_events(
     run_id: Annotated[str, Field(description="The run id whose live event stream to follow")],
     after_seq: Annotated[
@@ -3324,6 +3361,7 @@ def _authoring_success(response: requests.Response) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_gated
 async def workflow_create(
     name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
     source: Annotated[str, Field(description="The Python spec's full source text")],
@@ -3367,6 +3405,7 @@ async def workflow_create(
 
 
 @mcp.tool()
+@_gated
 async def workflow_update(
     name: Annotated[str, Field(description="Bare workflow name of the EXISTING spec")],
     source: Annotated[str, Field(description="The replacement Python source text")],
@@ -3421,6 +3460,7 @@ async def workflow_update(
 
 
 @mcp.tool()
+@_gated
 async def workflow_get(
     name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
 ) -> Dict[str, Any]:
@@ -3460,6 +3500,7 @@ async def workflow_get(
 
 
 @mcp.tool()
+@_gated
 async def workflow_validate(
     source: Annotated[str, Field(description="Python spec source text to lint, as a draft")],
 ) -> Dict[str, Any]:

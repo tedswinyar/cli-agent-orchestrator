@@ -100,14 +100,16 @@ def tool_covered(allowed: Iterable[str], tool: str, server: str) -> bool:
     """Whether a CAO allowlist grants ``tool`` on MCP ``server``.
 
     Covered by ``*``, by a server selector (``@cao-mcp-server`` or a glob that
-    matches it), by the per-tool form ``@cao-mcp-server/<tool>``, or by the
-    bare tool name.
+    matches it), or by the per-tool form ``@cao-mcp-server/<tool>``. A bare
+    tool name never grants an MCP tool: bare names are provider-native
+    vocabulary (``fs_read``, ``execute_bash``), and the #671/#769 policy on
+    main pins that ``allowedTools: [assign]`` does not reach ``assign``.
     """
 
     for entry in allowed:
         if not isinstance(entry, str):
             continue
-        if entry == "*" or entry == tool:
+        if entry == "*":
             return True
         if "/" in entry and entry.startswith("@"):
             srv, _, name = entry[1:].partition("/")

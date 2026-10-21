@@ -53,7 +53,7 @@ is pure. Unknown actions are refused.
 
 | action            | resource                                   | rule for agent principals |
 |-------------------|--------------------------------------------|---------------------------|
-| `tool:call`       | tool name, `server=` keyword               | `cao-mcp-server`: default-deny unless `allowed_tools` covers the tool (`*`, `@cao-mcp-server`, a glob such as `@cao-*`, `@cao-mcp-server/<tool>`, or the bare name). Always allowed: `send_message`, `complete_assignment`, `workflow_return`, `answer_user_prompt`, `list_siblings`, `update_metadata` (the #671 ruling). `cao-ops-mcp-server`: denied. |
+| `tool:call`       | tool name, `server=` keyword               | `cao-mcp-server`: default-deny unless `allowed_tools` covers the tool (`*`, `@cao-mcp-server`, a glob such as `@cao-*`, or `@cao-mcp-server/<tool>`; a bare tool name never grants an MCP tool). Always allowed: `send_message`, `complete_assignment`, `workflow_return`, `answer_user_prompt`, `list_siblings`, `update_metadata` (the #671 ruling). `cao-ops-mcp-server`: denied. |
 | `terminal:create` | requested child `allowed_tools` tuple      | every entry must be within the ceiling (`delegate_tools` if set, else `allowed_tools`) |
 | `terminal:act_as` | claimed `caller_id`                        | allowed only for the principal's own `terminal_id` |
 | `run:cancel`, `run:resume`, `run:replay` | `RunRef(run_id, owner_terminal_id, ancestor_terminal_ids)` | owner, ancestor, or a run principal acting on its own run |

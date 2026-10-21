@@ -7,6 +7,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
+from cli_agent_orchestrator.ops_mcp_server.gate import gated
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
@@ -25,6 +26,12 @@ from cli_agent_orchestrator.utils.forwarded_env import (
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
+
+# Every ``@mcp.tool`` registration here stacks ``@gated`` directly under it (see
+# ``ops_mcp_server/gate.py``): the registered object is the gated wrapper, so no
+# ops tool is reachable by an agent terminal without ``check()`` refusing it
+# (``fleet:operator-only``). ``test/security/test_tool_gate_census.py`` fails
+# with file:line for any registration that lacks it.
 
 # (connect, read) seconds for every call to the CAO API server. The server is
 # localhost-only, so a slow connect means something is wrong rather than far
@@ -373,6 +380,7 @@ async def _launch_session_impl(
 
 
 @mcp.tool()
+@gated
 async def list_profiles() -> ProfileListResult:
     """List available agent profiles.
 
@@ -394,6 +402,7 @@ async def list_profiles() -> ProfileListResult:
 
 
 @mcp.tool()
+@gated
 async def get_profile_details(
     name: Annotated[str, Field(description="The agent profile name to inspect")],
 ) -> JsonDict:
@@ -421,6 +430,7 @@ async def get_profile_details(
 
 
 @mcp.tool()
+@gated
 async def install_profile(
     source: Annotated[str, Field(description="Agent name or https:// URL to install")],
     provider: Annotated[
@@ -486,6 +496,7 @@ async def install_profile(
 
 
 @mcp.tool()
+@gated
 async def launch_session(
     agent_profile: Annotated[str, Field(description="The agent profile to launch")],
     provider: Annotated[
@@ -575,6 +586,7 @@ async def launch_session(
 
 
 @mcp.tool()
+@gated
 async def send_session_message(
     terminal_id: Annotated[str, Field(description="The terminal ID to deliver the message to")],
     message: Annotated[str, Field(description="The message text to deliver")],
@@ -691,6 +703,7 @@ def _read_session_output_impl(
 
 
 @mcp.tool()
+@gated
 async def read_session_output(
     terminal_id: Annotated[
         Optional[str],
@@ -748,6 +761,7 @@ async def read_session_output(
 
 
 @mcp.tool()
+@gated
 async def get_terminal_status(
     terminal_id: Annotated[str, Field(description="The terminal ID to inspect")],
 ) -> JsonDict:
@@ -778,6 +792,7 @@ async def get_terminal_status(
 
 
 @mcp.tool()
+@gated
 async def get_terminal_output(
     terminal_id: Annotated[str, Field(description="The terminal ID to read output from")],
     mode: Annotated[
@@ -829,6 +844,7 @@ async def get_terminal_output(
 
 
 @mcp.tool()
+@gated
 async def list_sessions() -> SessionListResult:
     """List active CAO sessions with terminal counts and statuses.
 
@@ -847,6 +863,7 @@ async def list_sessions() -> SessionListResult:
 
 
 @mcp.tool()
+@gated
 async def get_session_info(
     session_name: Annotated[str, Field(description="The CAO session name to inspect")],
 ) -> JsonDict:
@@ -874,6 +891,7 @@ async def get_session_info(
 
 
 @mcp.tool()
+@gated
 async def shutdown_session(
     session_name: Annotated[str, Field(description="The CAO session name to shut down")],
 ) -> JsonDict:

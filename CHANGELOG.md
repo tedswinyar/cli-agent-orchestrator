@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Experimental:** every tool on `cao-mcp-server` and `cao-ops-mcp-server` is gated at the MCP
+  boundary through `security.authz.check()` with the #671 default-deny ruling (callbacks and
+  discovery always allowed; `@cao-mcp-server/<tool>` grants one tool; ops tools operator-only).
+  Warn mode by default (`CAO_HOME_DIR/logs/authz.jsonl` records would-be refusals); refusals
+  under `CAO_PRINCIPAL_ENFORCE=1`. The six delegation tools stay refused as before. The seven
+  `examples/aws` profiles now name `@cao-mcp-server` explicitly (#671).
+
 - **Experimental:** per-terminal principal (#965): `security/principal.py` resolves a bearer to an
   `operator` / `terminal` / `run` / `anonymous` principal, `security/authz.py` is the single
   `authorize()` chokepoint with a `CAO_PRINCIPAL_ENFORCE` flag (default warn mode, nothing refused),
