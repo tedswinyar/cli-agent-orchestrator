@@ -136,6 +136,47 @@ The current tools are grouped by purpose:
 Installed [plugins](plugins.md#mcp-tool-surfaces) can register additional tools on this
 server through `on_mcp_server`, the same hook `cao-mcp-server` honours.
 
+### Admission rule for agent profiles (experimental)
+
+`cao-ops-mcp-server` is a control plane: its tools create, message and destroy
+sessions and install profiles for the whole fleet, where `cao-mcp-server` acts
+inside one session. An *agent profile* that lists the ops server under
+`mcpServers` therefore needs an explicit operator grant, and CAO checks for one
+at configuration time, the way Pod Security Admission checks a pod before it is
+scheduled:
+
+- **What is detected.** An `mcpServers` entry whose key is exactly
+  `cao-ops-mcp-server`, or whose command launches it under any key: the bare
+  console script, a path to it, `uvx --from <pkg> cao-ops-mcp-server`,
+  `uv run` / `pipx run` forms, `python -m cli_agent_orchestrator.ops_mcp_server.server`,
+  or a shell wrapper. The full server name is matched, never a prefix.
+- **What counts as the grant.** The server selector `@cao-ops-mcp-server` in
+  `allowedTools` (or a per-tool form such as `@cao-ops-mcp-server/list_sessions`,
+  or an unrestricted `*`). It is the same grammar as every other grant; there is
+  no separate keyword. A built-in `role` never carries it, and a glob such as
+  `@cao-*` is deliberately not a grant, so the grant is greppable by name. A
+  role-shaped grant is a custom role in `settings.json` whose list includes the
+  selector.
+- **What happens without it.** With `CAO_PRINCIPAL_ENFORCE=1`, `cao install`,
+  `POST /agents/profiles/install` and the `install_profile` MCP tool refuse with
+  a message naming the profile, the server and the fix, and nothing is written.
+  In the default warn mode the install proceeds, the result carries the warning
+  in `message` and `warnings`, and one line is appended to
+  `CAO_HOME_DIR/logs/authz.jsonl` (`action: profile:install`).
+- **Re-checked at launch.** An install-time check alone is bypassable by a
+  hand-edited store file or a profile installed before the rule existed, so the
+  launch loader asks the same question of what is on disk (`action:
+  profile:load`); enforcing, the launch fails closed. `cao profile show` and the
+  read routes still serve the profile so you can fix it. The call-time gate in
+  [`security/authz.py`](security/agent-principal.md) remains the last line for
+  a profile that is already running.
+- **Before installing**, `cao profile validate <file>` reports the pairing as a
+  warning (an error when enforcing).
+
+This is a guardrail against runaway or prompt-injected agents, not a security
+boundary: CAO is a single-user local tool and a worker with shell access can
+edit the file or call the API directly.
+
 `launch_session` returns the resolved `provider` alongside `session_name` and
 `terminal_id`, so a caller can confirm a worker landed on the provider it asked
 for before sending work. CAO stores session names with a `cao-` prefix

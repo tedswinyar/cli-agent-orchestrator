@@ -18,18 +18,23 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/510
 """
 
 import json
+import logging
 import re
+import shlex
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files as _pkg_files
 from itertools import islice
-from typing import Any, Iterator, Literal, Optional
+from typing import Any, Iterator, Literal, Mapping, Optional
 
 import frontmatter
 from jsonschema import Draft202012Validator as _Draft202012Validator
 from jsonschema import ValidationError, validators
 
 from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+from cli_agent_orchestrator.utils.tool_mapping import _get_role_defaults
+
+logger = logging.getLogger(__name__)
 
 Severity = Literal["error", "warning"]
 
@@ -84,6 +89,259 @@ for _tools in ROLE_TOOL_DEFAULTS.values():
     _VALID_TOOL_VOCAB.update(_tools)
 
 _BUILTIN_ROLES: set[str] = set(ROLE_TOOL_DEFAULTS.keys())
+
+
+# --- cao-ops-mcp-server admission --------------------------------------------
+#
+# ``cao-ops-mcp-server`` is CAO's control plane: its tools create, message and
+# destroy sessions and install profiles for the whole fleet, while
+# ``cao-mcp-server`` acts inside one session. A profile that merely listed the
+# ops server under ``mcpServers`` used to get that reach whatever its allowlist
+# said, because the allowlist was enforced inside ``cao-mcp-server``'s own code
+# and nothing consulted it for a second server. The admission rule here is the
+# configuration-time half of closing that, in the spirit of Pod Security
+# Admission: a profile may pair the ops server only with an explicit operator
+# grant, and an install or launch that pairs it with a restricted allowlist is
+# refused (``CAO_PRINCIPAL_ENFORCE``) or warned about and audited (default).
+# The call-time gate in ``security.authz`` is the half that holds for a
+# hand-edited file or a profile installed before this rule existed.
+#
+# The grant is the ordinary allowlist grammar, not a new keyword: the server
+# selector ``@cao-ops-mcp-server`` (or a per-tool ``@cao-ops-mcp-server/<tool>``,
+# or an unrestricted ``*``). A role counts only when its *resolved* defaults
+# carry that selector, which no built-in role does, so an operator who wants a
+# role-shaped grant defines one in ``settings.json``. Globs such as ``@cao-*``
+# are deliberately not a grant: a control-plane grant must be greppable by the
+# full server name, which is also why detection below matches the full name
+# and never a prefix.
+
+OPS_MCP_SERVER_NAME = "cao-ops-mcp-server"
+OPS_MCP_SERVER_MODULE = "cli_agent_orchestrator.ops_mcp_server.server"
+OPS_GRANT = f"@{OPS_MCP_SERVER_NAME}"
+#: Audit actions recorded through ``security.audit.record``. They are not in
+#: ``authz.ACTIONS`` because no principal-vs-resource decision is being made:
+#: the rule is about a profile's content, and ``authz`` is left untouched.
+PROFILE_INSTALL_ACTION = "profile:install"
+PROFILE_LOAD_ACTION = "profile:load"
+OPS_ADMISSION_RULE = "profile:ops-admission"
+
+# The grant must be a recognised allowlist entry, or the vocabulary advisory
+# below would warn about the very entry this rule asks operators to add.
+_VALID_TOOL_VOCAB.add(OPS_GRANT)
+
+
+class OpsAdmissionRefused(ValueError):
+    """A profile pairs ``cao-ops-mcp-server`` with a restricted allowlist, enforcing."""
+
+
+@dataclass(frozen=True)
+class OpsAdmission:
+    """Outcome of the admission check for one profile.
+
+    ``named_by`` lists the ``mcpServers`` keys that are the ops server, by exact
+    key or because their command launches it. ``granted`` is whether the
+    profile's own allowlist carries an explicit operator grant; it is only
+    computed when ``named_by`` is non-empty.
+    """
+
+    named_by: tuple[str, ...]
+    granted: bool
+
+    @property
+    def names_ops_server(self) -> bool:
+        return bool(self.named_by)
+
+    @property
+    def violates(self) -> bool:
+        return self.names_ops_server and not self.granted
+
+
+def _command_tokens(value: object) -> Iterator[str]:
+    """Yield one command/argument string and its shell-split words.
+
+    The split is what lets ``sh -c "exec cao-ops-mcp-server"`` be seen; the raw
+    value is yielded too so an unsplittable string still matches as a whole.
+    """
+    if not isinstance(value, str) or not value:
+        return
+    yield value
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return
+    for word in words:
+        if word != value:
+            yield word
+
+
+def _token_is_ops_server(token: str) -> bool:
+    """Whether one word names the ops server executable or module, by full name."""
+    if token == OPS_MCP_SERVER_MODULE:
+        return True
+    leaf = re.split(r"[\\/]", token)[-1]
+    if leaf.lower().endswith(".exe"):
+        leaf = leaf[: -len(".exe")]
+    return leaf == OPS_MCP_SERVER_NAME
+
+
+def entry_launches_ops_server(entry: object) -> bool:
+    """Whether one ``mcpServers`` entry launches ``cao-ops-mcp-server``.
+
+    Catches the key-named-differently shapes: the bare console script, an
+    absolute path to it, ``uvx --from <pkg> cao-ops-mcp-server`` (the form the
+    docs and the ``cao`` operator plugin use), ``uv run`` / ``pipx run`` forms,
+    ``python -m cli_agent_orchestrator.ops_mcp_server.server`` and a shell
+    wrapper. Remote (``url``) entries are never the ops server, which is stdio.
+    """
+    if not isinstance(entry, Mapping):
+        return False
+    candidates: list[object] = [entry.get("command")]
+    args = entry.get("args")
+    if isinstance(args, list):
+        candidates.extend(args)
+    for raw in candidates:
+        for token in _command_tokens(raw):
+            if _token_is_ops_server(token):
+                return True
+    return False
+
+
+def ops_server_entries(mcp_servers: object) -> tuple[str, ...]:
+    """Keys of the ``mcpServers`` entries that are the ops server.
+
+    An entry counts when its key is exactly ``cao-ops-mcp-server`` (full name,
+    never a prefix: ``cao-ops-mcp-server-v2`` with another command is some other
+    server) or when its command launches the ops server under any key.
+    """
+    if not isinstance(mcp_servers, Mapping):
+        return ()
+    hits: list[str] = []
+    for key, entry in mcp_servers.items():
+        if key == OPS_MCP_SERVER_NAME or entry_launches_ops_server(entry):
+            hits.append(str(key))
+    return tuple(hits)
+
+
+def is_ops_grant(entry: object) -> bool:
+    """Whether one allowlist entry is an explicit grant to the ops server.
+
+    ``*`` (unrestricted), the server selector, or a per-tool selector with a
+    non-empty tool name. A glob that happens to match the name is not a grant.
+    """
+    if not isinstance(entry, str):
+        return False
+    if entry == "*" or entry == OPS_GRANT:
+        return True
+    return entry.startswith(OPS_GRANT + "/") and len(entry) > len(OPS_GRANT) + 1
+
+
+def ops_grant_present(allowed_tools: object, role: object) -> bool:
+    """Whether a profile's own allowlist grants the ops server explicitly.
+
+    Reads ``allowedTools`` else the role's defaults (settings.json custom roles
+    first, then built-ins, the same lookup ``resolve_allowed_tools`` uses) and
+    nothing else. Deliberately not ``resolve_allowed_tools`` itself: that is a
+    grant site, and ``test_no_auto_grant.py`` requires every grant site to
+    append the delivered MCP servers to a role's list, which is exactly the
+    "declaring a server is enough to use it" behaviour this rule exists to
+    stop. This function only ever asks what the operator wrote. An unknown role
+    grants nothing.
+    """
+    if allowed_tools is not None:
+        if not isinstance(allowed_tools, list):
+            return False
+        effective: list[Any] = allowed_tools
+    elif role is None:
+        effective = list(ROLE_TOOL_DEFAULTS["developer"])
+    elif not isinstance(role, str):
+        return False
+    else:
+        defaults = _get_role_defaults(role)
+        if defaults is None:
+            return False
+        effective = defaults
+    return any(is_ops_grant(entry) for entry in effective)
+
+
+def check_ops_admission(mcp_servers: object, allowed_tools: object, role: object) -> OpsAdmission:
+    """Pure admission decision over the three frontmatter fields involved."""
+    named = ops_server_entries(mcp_servers)
+    if not named:
+        return OpsAdmission((), granted=False)
+    return OpsAdmission(named, granted=ops_grant_present(allowed_tools, role))
+
+
+def ops_admission_message(profile_name: Optional[str], admission: OpsAdmission) -> str:
+    """The one message every surface shows: names the profile, the server, the fix."""
+    subject = f"Profile '{profile_name}'" if profile_name else "This profile"
+    noun = "entry" if len(admission.named_by) == 1 else "entries"
+    entries = ", ".join(f"'{key}'" for key in admission.named_by)
+    return (
+        f"{subject} pairs the control-plane MCP server '{OPS_MCP_SERVER_NAME}' "
+        f"(mcpServers {noun} {entries}) with a restricted allowlist and no operator "
+        f"grant. Add '{OPS_GRANT}' to allowedTools to grant fleet-wide session "
+        f"control explicitly, or remove the server from mcpServers."
+    )
+
+
+def record_ops_admission(
+    profile_name: str, admission: OpsAdmission, action: str, enforce: bool
+) -> None:
+    """Append the decision to the authz audit log as an operator principal.
+
+    Goes through ``security.audit.record`` unchanged: refusals are always
+    written, allows only under ``CAO_AUTHZ_AUDIT_ALLOWS``. Never raises.
+    """
+    from cli_agent_orchestrator.security import audit
+    from cli_agent_orchestrator.security.auth import FULL_SCOPE_SET
+    from cli_agent_orchestrator.security.authz import Decision
+    from cli_agent_orchestrator.security.principal import Principal
+
+    principal = Principal(
+        kind="operator", scopes=frozenset(FULL_SCOPE_SET), agent_profile=profile_name
+    )
+    if admission.violates:
+        decision = Decision(
+            False, OPS_ADMISSION_RULE, ops_admission_message(profile_name, admission)
+        )
+    else:
+        decision = Decision(
+            True, OPS_ADMISSION_RULE, f"profile '{profile_name}' grants {OPS_GRANT} explicitly"
+        )
+    audit.record(principal, action, f"{OPS_MCP_SERVER_NAME}/{profile_name}", decision, enforce)
+
+
+def admit_profile(
+    profile_name: str,
+    mcp_servers: object,
+    allowed_tools: object,
+    role: object,
+    *,
+    action: str,
+) -> Optional[str]:
+    """Apply the admission rule at an install or launch.
+
+    Returns ``None`` when the profile does not name the ops server or grants it
+    explicitly. When it pairs the server with a restricted allowlist: under
+    ``CAO_PRINCIPAL_ENFORCE`` raises :class:`OpsAdmissionRefused` carrying the
+    message; otherwise logs a warning, records the audit line and returns the
+    message for the caller to surface. A profile without the ops server costs
+    nothing here: no settings read, no audit line.
+    """
+    admission = check_ops_admission(mcp_servers, allowed_tools, role)
+    if not admission.names_ops_server:
+        return None
+    from cli_agent_orchestrator.security.authz import enforcing
+
+    enforce = enforcing()
+    record_ops_admission(profile_name, admission, action, enforce)
+    if not admission.violates:
+        return None
+    message = ops_admission_message(profile_name, admission)
+    if enforce:
+        raise OpsAdmissionRefused(message)
+    logger.warning("%s (warn mode; set CAO_PRINCIPAL_ENFORCE=1 to refuse) [%s]", message, action)
+    return message
 
 
 @dataclass(frozen=True)
@@ -502,12 +760,30 @@ def validate_frontmatter(metadata: dict) -> list[ValidationMessage]:
     # schema reports the type error, so this advisory check simply stands aside.
     role = metadata.get("role")
     if isinstance(role, str) and role and role not in _BUILTIN_ROLES:
-        collector.add(
+        if not collector.add(
             ValidationMessage(
                 "warning",
                 f"role '{role}' is not a built-in CAO role "
                 f"({', '.join(sorted(_BUILTIN_ROLES))}). "
                 f"Ensure it is defined in your settings.json custom roles.",
+            )
+        ):
+            return collector.finalize()
+
+    # 7. cao-ops-mcp-server admission. The same rule ``install_agent`` and the
+    #    launch loader apply, surfaced here so ``cao profile validate`` tells an
+    #    author before the install does. An error when enforcement is on, since
+    #    the install would refuse; a warning otherwise, since it would install.
+    admission = check_ops_admission(metadata.get("mcpServers"), metadata.get("allowedTools"), role)
+    if admission.violates:
+        from cli_agent_orchestrator.security.authz import enforcing
+
+        name = metadata.get("name")
+        collector.add(
+            ValidationMessage(
+                "error" if enforcing() else "warning",
+                ops_admission_message(name if isinstance(name, str) and name else None, admission),
+                "mcpServers",
             )
         )
 

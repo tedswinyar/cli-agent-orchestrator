@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `security/audit.py` appends refusals to `CAO_HOME_DIR/logs/authz.jsonl`. Adds a nullable
   `credential_digest` column to `terminals`. Not yet wired into terminal creation. See
   `docs/security/agent-principal.md`.
+- **Experimental:** `install_agent` and the launch loader apply an admission rule to profiles that
+  pair the control-plane `cao-ops-mcp-server` (by key, or by a command that launches it) with a
+  restricted allowlist and no explicit `@cao-ops-mcp-server` grant. Behind `CAO_PRINCIPAL_ENFORCE`
+  the install or launch is refused with a message naming the profile, the server and the fix;
+  by default it proceeds with a visible warning and an `authz.jsonl` line. `cao profile validate`
+  reports the pairing. See `docs/control-planes.md`.
 
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
