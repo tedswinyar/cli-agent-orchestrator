@@ -461,6 +461,30 @@ def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
     return None
 
 
+def _agent_bearer_scopes(token: str) -> Optional[List[str]]:
+    """Scopes for a per-terminal (``cao_t_``) or per-run (``cao_r_``) bearer (#965).
+
+    Agent credentials are neither the operator's local token nor an IdP JWT, so
+    with auth ENABLED they used to die here with ``invalid token`` before
+    :func:`security.principal.get_current_principal` ever ran, and terminal
+    credentials only worked on default-off servers. A bearer carrying one of
+    the agent prefixes is resolved through the principal module instead (digest
+    lookup; a missing or reclaimed row is 401 ``terminal credential revoked``)
+    and granted the AGENT scope set, read and write, never admin. Any other
+    bearer returns ``None`` and takes today's operator / IdP path unchanged.
+
+    Imported lazily: ``security.principal`` imports this module at load time.
+    """
+
+    from cli_agent_orchestrator.security import principal as _principal
+
+    if token.startswith(_principal.TERMINAL_TOKEN_PREFIX):
+        return sorted(_principal._resolve_terminal_token(token).scopes)
+    if token.startswith(_principal.RUN_TOKEN_PREFIX):
+        return sorted(_principal._resolve_run_token(token).scopes)
+    return None
+
+
 async def get_current_scopes(
     authorization: Optional[str] = Header(default=None),
 ) -> List[str]:
@@ -468,7 +492,10 @@ async def get_current_scopes(
 
     Default-off: when auth is disabled, returns the full scope set and never
     inspects the request. When enabled, a missing/invalid/
-    expired bearer token yields HTTP 401.
+    expired bearer token yields HTTP 401. A per-terminal or per-run agent
+    bearer (``cao_t_`` / ``cao_r_``, #965) is resolved by
+    :func:`_agent_bearer_scopes` to the agent scope set before the operator /
+    IdP verification runs.
 
     ``authorization`` is bound to the ``Authorization`` request header via
     FastAPI's ``Header`` so the function can be used directly as
@@ -485,6 +512,9 @@ async def get_current_scopes(
             detail="missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    agent_scopes = _agent_bearer_scopes(token)
+    if agent_scopes is not None:
+        return agent_scopes
     try:
         return extract_scopes_from_token(token)
     except Exception as exc:
