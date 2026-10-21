@@ -105,6 +105,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
+from cli_agent_orchestrator.security.authz import TERMINAL_CREATE, check
+from cli_agent_orchestrator.security.principal import Principal
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
@@ -1051,6 +1053,7 @@ async def create_terminal(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    principal: Optional[Principal] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1269,11 +1272,24 @@ async def create_terminal(
             that is excluded above, or a difference between the request and
             what the mapped terminal actually persisted, is not caught here.
 
+        principal: The authenticated caller (#965, WS2), when the create came
+            in over the API. A ``terminal`` principal is bounded by ITS OWN
+            ROW -- ``delegate_tools`` when set (#948), else ``allowed_tools`` --
+            and the requested ``allowed_tools`` must fit inside that ceiling
+            (Step 0c below). Operators, the default-off anonymous caller and
+            ``None`` (in-process callers: sidecars, workflow steps, tests) take
+            today's path unchanged. A client-asserted ceiling is never read
+            here: when a principal is present the ceiling is the row's.
+
     Returns:
         Terminal object with all metadata populated
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        HTTPException: 403 when ``CAO_PRINCIPAL_ENFORCE=1`` and a terminal
+            principal requests ``allowed_tools`` outside its own ceiling
+            (rule ``terminal:ceiling``). In warn mode (default) the refusal is
+            only audited and the create proceeds as today.
         IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
             different request (surfaced as HTTP 409 by both create endpoints)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
@@ -1282,6 +1298,19 @@ async def create_terminal(
             server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    # Step 0c (#965, WS2): delegation ceiling, read from the PRINCIPAL, before
+    # any allocation (claim, worktree, window, row, provider). The ceiling is
+    # ``authz.ceiling_of(principal)`` -- the caller's own row -- never a value
+    # the client asserted, so a terminal cannot widen its children by naming a
+    # different ceiling (or a different caller: the API layer has already
+    # derived ``caller_id`` from the credential). Operators and in-process
+    # callers (``principal is None``) are unbounded here exactly as today; on
+    # the #948 branch that is the row-read Step 0c inside the unguarded body,
+    # which stays the operator path. The comparator is ``authz``'s
+    # ``_entry_within_ceiling``; when #948's ``utils/delegation`` lands, that
+    # comparator replaces it in ONE place (authz), not here.
+    if principal is not None and not principal.is_operator:
+        check(principal, TERMINAL_CREATE, tuple(allowed_tools or ()))
     state = _EphemeralLaunchState()
     try:
         return await _create_terminal_unguarded(

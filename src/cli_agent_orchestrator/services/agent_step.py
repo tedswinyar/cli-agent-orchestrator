@@ -34,6 +34,7 @@ from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStat
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
+from cli_agent_orchestrator.security.principal import Principal
 from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
@@ -452,6 +453,7 @@ async def run_agent_step(
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    principal: Optional[Principal] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -476,6 +478,10 @@ async def run_agent_step(
         prompt: The message to send. Any caller-side prompt shaping (e.g. the
             codex handoff banner) is applied BEFORE calling this; the substrate
             sends ``prompt`` verbatim.
+        principal: The authenticated API caller (#965, WS2), forwarded to
+            ``terminal_service.create_terminal`` so a terminal principal's
+            requested ``allowed_tools`` are bounded by its own row (Step 0c).
+            ``None`` for in-process callers (the run engine), unchanged path.
         session_name: Optional existing session to create the terminal in. When
             provided, the terminal is added as a window to that EXISTING session
             (``new_session=False``). When None, a brand-new tmux session is
@@ -700,6 +706,7 @@ async def run_agent_step(
             use_worktree=use_worktree,
             claim_id=claim_id,
             description=description,
+            principal=principal,
         )
         terminal_id = terminal.id
 

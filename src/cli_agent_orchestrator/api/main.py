@@ -127,6 +127,8 @@ from cli_agent_orchestrator.security.auth import (
     is_idp_configured,
     require_any_scope,
 )
+from cli_agent_orchestrator.security.authz import OPERATOR_ROUTE, TERMINAL_ACT_AS, check
+from cli_agent_orchestrator.security.principal import Principal, get_current_principal
 from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
@@ -2494,6 +2496,35 @@ async def agui_run(
 mount_widget_static(app)
 
 
+def _effective_caller_id(principal: Principal, claimed: Optional[str]) -> Optional[str]:
+    """Derive the caller from the credential, not from the request (#965, WS2).
+
+    Every route that reads a client-supplied ``caller_id`` (query, body or
+    callback environment) routes it through here, and the structural guard
+    ``test/api/test_caller_identity_guard.py`` fails on one that does not.
+
+    - Operator principals (shared bearer) and the default-off anonymous caller
+      are unbounded: ``claimed`` is returned unchanged, exactly as today.
+    - A ``terminal`` (or ``run``) principal IS the caller. The effective
+      caller is ``principal.terminal_id`` regardless of what the request
+      claimed. A claim naming a DIFFERENT terminal is a substitution
+      (``terminal:impersonation``): under ``CAO_PRINCIPAL_ENFORCE=1`` it is
+      refused with 403 naming the mismatch; in warn mode it is audited and the
+      credential's identity is used anyway. An omitted claim is simply filled
+      in from the credential, so a terminal-credentialed client cannot be
+      treated as the operator by leaving the field out.
+
+    ``caller_ceiling`` (#948, not on this branch yet) follows the same rule
+    when it lands: with a terminal principal present the ceiling comes from
+    the row (``terminal_service.create_terminal`` Step 0c), never the client.
+    """
+    if principal.is_operator:
+        return claimed
+    if claimed is not None:
+        check(principal, TERMINAL_ACT_AS, claimed)
+    return principal.terminal_id
+
+
 def _require_ephemeral_enabled(request: Request) -> Dict[str, Any]:
     """Gate the opt-in surface before reading an untrusted body."""
     from cli_agent_orchestrator.services import ephemeral_service
@@ -2519,10 +2550,13 @@ async def create_ephemeral_agent_endpoint(
     caller_id: Optional[str] = None,
     settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict[str, Any]:
     """Create an agent spec and files; raw input failures never echo submitted values."""
     from cli_agent_orchestrator.services import ephemeral_service
 
+    # #965: the caller is the credential, not the query string.
+    caller_id = _effective_caller_id(principal, caller_id)
     try:
         try:
             raw = await request.json()
@@ -2546,10 +2580,13 @@ async def claim_ephemeral_agent_endpoint(
     caller_id: Optional[str] = None,
     settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict[str, Any]:
     """Claim with a single settings snapshot and redacted body validation."""
     from cli_agent_orchestrator.services import ephemeral_service
 
+    # #965: the caller is the credential, not the query string.
+    caller_id = _effective_caller_id(principal, caller_id)
     try:
         try:
             raw = await request.json()
@@ -3506,6 +3543,7 @@ async def create_session(
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
 
@@ -3559,6 +3597,13 @@ async def create_session(
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
     """
+    # #965 (WS2): this is an OPERATOR route. It carries no ``caller_id`` and no
+    # ceiling, so a terminal-credentialed client reaching it would be treated
+    # as the operator, i.e. unbounded. Refused (enforce) or audited (warn) for
+    # any non-operator principal, before the try below whose catch-all arm
+    # would turn the 403 into a 500. Operators and the default-off anonymous
+    # caller are unaffected.
+    check(principal, OPERATOR_ROUTE, "POST /sessions")
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
     # Structural caps on group/metadata (call-me-ram, PR #433 review) are
@@ -3815,6 +3860,7 @@ async def create_terminal_in_session(
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Terminal:
     """Create additional terminal in existing session.
 
@@ -3859,6 +3905,10 @@ async def create_terminal_in_session(
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
     """
+    # #965 (WS2): the caller is the credential, not the query string. A terminal
+    # principal naming another terminal is refused (enforce) or audited (warn),
+    # and its own id is what the row records either way.
+    caller_id = _effective_caller_id(principal, caller_id)
     try:
         validate_tmux_name(session_name, "session_name")
         if model is not None:
@@ -3929,6 +3979,9 @@ async def create_terminal_in_session(
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            # #965: the ceiling bounding this create is the principal's own row
+            # (terminal_service Step 0c), never a value the client asserted.
+            principal=principal,
         )
         return result
     except HTTPException:
@@ -4463,6 +4516,7 @@ async def run_step(
     background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> RunStepResponse:
     """Run a single agent step through the shared substrate (N0, #312).
 
@@ -4509,6 +4563,17 @@ async def run_step(
     ``GET /handoff-results/{job_id}`` at any point thereafter. Requests without
     a ``job_id`` behave exactly as before (no persistence overhead).
     """
+    # #965 (WS2): ``body.caller_id`` is a client assertion. Derive the caller
+    # from the credential first; a substituted claim is refused (enforce) or
+    # audited (warn) before any state is recorded. The body is re-issued with
+    # the effective caller so every later ``body.caller_id`` read (working
+    # directory inheritance, the fingerprint, the substrate call) sees ONE
+    # value. WS4 (run ownership) stamps ``owner_terminal_id`` from this same
+    # principal and gates the run cancel/resume/replay routes with
+    # ``check(principal, RUN_*, RunRef)``; those routes are not touched here.
+    effective_caller_id = _effective_caller_id(principal, body.caller_id)
+    if effective_caller_id != body.caller_id:
+        body = body.model_copy(update={"caller_id": effective_caller_id})
     job_id = body.job_id  # None when the caller omits it (backward-compatible)
 
     # BR-31: for a script-tier run-step call, record the live terminal into the
@@ -4793,6 +4858,9 @@ async def run_step(
             use_worktree=body.use_worktree,
             job_id=job_id,
             claim_id=body.claim_id,
+            # #965: the ceiling bounding a fresh step terminal is the principal's
+            # own row (terminal_service Step 0c), never ``body.allowed_tools``.
+            principal=principal,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
