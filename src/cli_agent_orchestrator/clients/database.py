@@ -168,6 +168,10 @@ class TerminalModel(Base):
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
+    # SHA-256 hex digest of this terminal's ``cao_t_`` credential (#965). The
+    # plaintext is never stored; a database read cannot yield a usable bearer.
+    # NULL for rows minted before the principal landed or created without one.
+    credential_digest = Column(String, nullable=True)
     # Provider-specific launch variant whose semantics must survive cao-server
     # restarts.  Kept generic so providers other than Kimi can use the same
     # lifecycle seam without overloading Kiro's ``engine`` or user-owned
@@ -2019,6 +2023,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
             conn.commit()
             logger.info("Migration: added model_honored column to terminals table")
+        if "credential_digest" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN credential_digest TEXT")
+            conn.commit()
+            logger.info("Migration: added credential_digest column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -2272,6 +2280,31 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
             "last_active": terminal.last_active,
         }
+
+
+def get_terminal_by_credential_digest(digest: str) -> Optional[TerminalModel]:
+    """Return the terminal row whose ``credential_digest`` equals ``digest`` (#965).
+
+    The row is returned detached with its columns loaded, so attribute reads
+    work after the session closes. ``None`` when no live row carries the
+    digest, which is how a revoked (deleted) terminal's credential fails.
+    """
+    if not digest:
+        return None
+    with SessionLocal() as db:
+        return db.query(TerminalModel).filter(TerminalModel.credential_digest == digest).first()
+
+
+def set_terminal_credential_digest(terminal_id: str, digest: Optional[str]) -> bool:
+    """Store (or clear, with ``None``) a terminal's credential digest (#965)."""
+    with SessionLocal() as db:
+        count = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .update({TerminalModel.credential_digest: digest})
+        )
+        db.commit()
+        return bool(count)
 
 
 def update_terminal_description(terminal_id: str, description: Optional[str]) -> bool:

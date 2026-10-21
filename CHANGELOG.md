@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Experimental:** per-terminal principal (#965): `security/principal.py` resolves a bearer to an
+  `operator` / `terminal` / `run` / `anonymous` principal, `security/authz.py` is the single
+  `authorize()` chokepoint with a `CAO_PRINCIPAL_ENFORCE` flag (default warn mode, nothing refused),
+  and `security/audit.py` appends refusals to `CAO_HOME_DIR/logs/authz.jsonl`. Adds a nullable
+  `credential_digest` column to `terminals`. Not yet wired into terminal creation. See
+  `docs/security/agent-principal.md`.
+
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
   are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
