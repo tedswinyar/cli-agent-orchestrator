@@ -171,6 +171,9 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
 
     # server.py defaults sender_id to "supervisor" when unset
     monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    # security.agent_credential prefers this over the operator token (#965);
+    # a suite run inside a CAO terminal must not present the host's credential.
+    monkeypatch.delenv("CAO_TERMINAL_TOKEN", raising=False)
     # server.py reads these for workflow_return context detection
     monkeypatch.delenv("CAO_WORKFLOW_RUN_ID", raising=False)
     monkeypatch.delenv("CAO_WORKFLOW_STEP_ID", raising=False)

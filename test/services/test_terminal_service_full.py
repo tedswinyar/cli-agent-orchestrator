@@ -3,7 +3,7 @@
 import asyncio
 import os
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -383,6 +383,8 @@ class TestCreateTerminal:
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
+            # Minted per call (#965); the lifecycle tests pin its value.
+            credential_digest=ANY,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -2134,6 +2136,8 @@ class TestCreateTerminalEnvVars:
         )
 
         extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        # The per-terminal credential rides the same channel (#965).
+        assert extra_env.pop("CAO_TERMINAL_TOKEN").startswith("cao_t_")
         # Both the persisted session env AND the per-step vars are present.
         assert extra_env == {
             "SESSION_VAR": "from-session",
@@ -2238,6 +2242,7 @@ class TestCreateTerminalEnvVars:
         )
 
         extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env.pop("CAO_TERMINAL_TOKEN").startswith("cao_t_")  # #965
         assert extra_env == {"SESSION_VAR": "from-session"}
 
     @pytest.mark.asyncio
@@ -2288,7 +2293,10 @@ class TestCreateTerminalEnvVars:
             env_vars={"FOO": "bar"},
         )
 
-        assert mock_tmux.create_session.call_args.kwargs["extra_env"] == {"FOO": "bar"}
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert extra_env.pop("CAO_TERMINAL_TOKEN").startswith("cao_t_")  # #965
+        assert extra_env == {"FOO": "bar"}
+        # The credential is NOT persisted with the operator's session env.
         mock_set_session_env.assert_called_once_with("cao-session", {"FOO": "bar"})
         mock_tmux.create_window.assert_not_called()
 

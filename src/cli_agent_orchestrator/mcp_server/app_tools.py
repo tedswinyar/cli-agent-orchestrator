@@ -44,6 +44,7 @@ from cli_agent_orchestrator.ext_apps import (
     register_apps,
     ui_meta,
 )
+from cli_agent_orchestrator.security.agent_credential import agent_credential
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -105,16 +106,16 @@ def _is_enabled() -> bool:
 def _auth_headers() -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal MCP->API hop, if any.
 
-    When the auth layer is enabled, the mutation endpoints enforce scope, so the
-    loopback call must carry the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN``
-    (see :func:`security.auth.get_local_bearer`). Default-off this returns an
-    empty mapping, so no header is attached and the no-auth posture is
-    byte-for-byte unchanged. Applied to reads too (not just mutations) so the
-    whole MCP->API hop is consistent.
+    Thin alias over :func:`security.agent_credential.agent_credential` (#965):
+    the per-terminal ``CAO_TERMINAL_TOKEN`` when CAO launched this process,
+    else the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer
+    is enabled (see :func:`security.auth.get_local_bearer`), else an empty
+    mapping so no header is attached and the no-auth posture is byte-for-byte
+    unchanged. Applied to reads too (not just mutations) so the whole MCP->API
+    hop is consistent.
     """
 
-    token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return agent_credential(operator_bearer=get_local_bearer)
 
 
 def _get_json(path: str, **params: Any) -> Any:

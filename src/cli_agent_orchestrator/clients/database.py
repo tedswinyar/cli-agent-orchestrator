@@ -2055,8 +2055,14 @@ def create_terminal(
     model_honored: Optional[bool] = None,
     initial_delivery: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
+    credential_digest: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``credential_digest`` (#965) is the SHA-256 of the terminal's minted
+    credential, written in the same INSERT as the row so there is never a
+    committed row whose token nothing resolves. The token itself is never
+    stored; ``set_terminal_credential_digest(terminal_id, None)`` revokes.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -2113,6 +2119,7 @@ def create_terminal(
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
             initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
+            credential_digest=credential_digest,
         )
         db.add(terminal)
         if idempotency_key:

@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `operator` / `terminal` / `run` / `anonymous` principal, `security/authz.py` is the single
   `authorize()` chokepoint with a `CAO_PRINCIPAL_ENFORCE` flag (default warn mode, nothing refused),
   and `security/audit.py` appends refusals to `CAO_HOME_DIR/logs/authz.jsonl`. Adds a nullable
-  `credential_digest` column to `terminals`. Not yet wired into terminal creation. See
+  `credential_digest` column to `terminals`. `create_terminal` mints a per-terminal credential and
+  injects it into the agent environment as `CAO_TERMINAL_TOKEN` on both backends; the MCP servers
+  and `cao agent` present it through one `security.agent_credential.agent_credential()` helper,
+  falling back to the operator token exactly as before; `delete_terminal` revokes it. See
   `docs/security/agent-principal.md`.
 - **Experimental:** `install_agent` and the launch loader apply an admission rule to profiles that
   pair the control-plane `cao-ops-mcp-server` (by key, or by a command that launches it) with a
