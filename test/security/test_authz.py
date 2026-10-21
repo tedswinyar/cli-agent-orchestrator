@@ -102,7 +102,8 @@ class TestToolCall:
         assert DISCOVERY_TOOLS == {"list_siblings", "update_metadata"}
 
     @pytest.mark.parametrize(
-        "allowed", [(), ("fs_read",), ("@other-server",), ("@cao-mcp-server/handoff",)]
+        "allowed",
+        [(), ("fs_read",), ("@other-server",), ("@cao-mcp-server/handoff",), ("assign",)],
     )
     def test_default_deny(self, allowed):
         d = authorize(term(allowed=allowed), TOOL_CALL, "assign", server=CAO_MCP_SERVER)
@@ -115,7 +116,6 @@ class TestToolCall:
             ("*",),
             ("@cao-mcp-server",),
             ("@cao-mcp-server/assign",),
-            ("assign",),
             ("fs_read", "@cao-*"),
         ],
     )

@@ -13,6 +13,7 @@ capabilities:
 allowedTools:
   - execute_bash
   - fs_read
+  - "@cao-mcp-server"
 mcpServers:
   cao-mcp-server:
     type: stdio
