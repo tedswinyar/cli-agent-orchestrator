@@ -119,6 +119,7 @@ from cli_agent_orchestrator.security.auth import (
     SCOPE_READ,
     SCOPE_WRITE,
     SCOPES_SUPPORTED,
+    _agent_bearer_scopes,
     _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
@@ -2028,7 +2029,11 @@ async def agui_stream(
                 detail="access_token query parameter required when auth is enabled",
             )
         try:
-            scopes = extract_scopes_from_token(access_token)
+            # #965 (WS2): a per-terminal / per-run bearer is resolved through
+            # the principal module (agent scopes, read+write) before the
+            # operator / IdP verifier, exactly as ``get_current_scopes`` does;
+            # any other token takes the existing path unchanged.
+            scopes = _agent_bearer_scopes(access_token) or extract_scopes_from_token(access_token)
         except HTTPException:
             raise
         except Exception:
@@ -8257,7 +8262,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             await websocket.close(code=4401, reason="Unauthorized")
             return
         try:
-            scopes = extract_scopes_from_token(token)
+            # #965 (WS2): agent bearers (``cao_t_`` / ``cao_r_``) resolve through
+            # the principal module first, as in ``get_current_scopes``; a
+            # revoked one raises and fails closed below like any bad token.
+            scopes = _agent_bearer_scopes(token) or extract_scopes_from_token(token)
         except Exception:
             logger.warning(
                 "Rejected WebSocket attach for terminal %r: auth enabled, invalid bearer token",
