@@ -2078,9 +2078,17 @@ async def test_cancel_during_insert_is_honoured_before_spawn(
 
     monkeypatch.setattr(workflow_journal, "update_run_state", track_state)
 
+    # #965 WS4: the endpoint resolves a principal; a direct call must supply one
+    # (the operator — here the default-off anonymous caller) or the Depends
+    # sentinel reaches the run-ownership gate.
+    from cli_agent_orchestrator.security.auth import FULL_SCOPE_SET
+    from cli_agent_orchestrator.security.principal import Principal
+
+    operator = Principal(kind="anonymous", scopes=frozenset(FULL_SCOPE_SET))
+
     def cancel():
         future = asyncio.run_coroutine_threadsafe(
-            api_main.cancel_workflow_run_endpoint(run_id, []), loop
+            api_main.cancel_workflow_run_endpoint(run_id, [], principal=operator), loop
         )
         try:
             replies.append(future.result(timeout=5))

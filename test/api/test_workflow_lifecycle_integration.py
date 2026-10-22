@@ -487,6 +487,12 @@ def test_tr1_crash_between_inserts_no_phantom_row(portal_client, monkeypatch):
         updated_at,
         tier="yaml",
         generation="1",
+        manifest_json=None,
+        # #965 WS4: ownership rides the same INSERT. This operator-started run
+        # carries no owner, and the row is rolled back either way, so the raw
+        # SQL below needn't write the (nullable) ownership columns.
+        owner_terminal_id=None,
+        ancestor_terminal_ids=(),
     ):
         # Do the REAL run-row INSERT, then raise a REAL sqlite3.Error before the step
         # seed -- inside ONE ``with conn`` transaction, so sqlite rolls BOTH back. This
