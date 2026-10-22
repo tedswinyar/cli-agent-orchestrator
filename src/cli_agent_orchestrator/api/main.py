@@ -128,7 +128,18 @@ from cli_agent_orchestrator.security.auth import (
     is_idp_configured,
     require_any_scope,
 )
-from cli_agent_orchestrator.security.authz import OPERATOR_ROUTE, TERMINAL_ACT_AS, check
+
+# #965 WS2 + WS4: the principal dependency and the authorize() entry points used by the
+# identity routes (terminal:act_as, operator:route) and the workflow run routes (run:*).
+from cli_agent_orchestrator.security.authz import (
+    OPERATOR_ROUTE,
+    RUN_CANCEL,
+    RUN_REPLAY,
+    RUN_RESUME,
+    TERMINAL_ACT_AS,
+    RunRef,
+    check,
+)
 from cli_agent_orchestrator.security.principal import Principal, get_current_principal
 from cli_agent_orchestrator.services import (
     approval_gate,
@@ -5895,12 +5906,46 @@ def _script_root(value: Optional[str]) -> str:
         ) from None
 
 
+def _ownership_of(principal: Any) -> Tuple[Optional[str], Tuple[str, ...]]:
+    """``(owner_terminal_id, ancestor_terminal_ids)`` to stamp on a run started by ``principal``.
+
+    #965 WS4. A terminal (or run) principal owns what it starts; its frozen creator chain
+    is the ancestry. Anything else — an operator, the anonymous caller with auth off, or
+    a direct call of the route function that bypassed dependency injection and left the
+    ``Depends`` marker in place — stamps ``(None, ())``: operator-owned.
+    """
+    if not isinstance(principal, Principal) or not principal.terminal_id:
+        return None, ()
+    return principal.terminal_id, tuple(principal.ancestors)
+
+
+def _ownership_kwargs(principal: Any) -> Dict[str, Any]:
+    """The engine kwargs for :func:`_ownership_of`, EMPTY for an operator start.
+
+    Empty rather than explicit ``None`` so an operator's call into ``start_run`` /
+    ``run_script_workflow`` is byte-identical to the pre-WS4 call (warn mode is
+    behaviour-preserving, and the engines' defaults already mean operator-owned).
+    """
+    owner, ancestors = _ownership_of(principal)
+    if owner is None:
+        return {}
+    return {"owner_terminal_id": owner, "ancestor_terminal_ids": ancestors}
+
+
 @app.post("/workflows/runs")
 async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Resolve a spec, run it to completion inline, return the WorkflowRunResult.
+
+    #965 WS4: the run is STAMPED with its owner at creation — ``principal.terminal_id``
+    and ``principal.ancestors`` travel into the engine entry of either tier and land on the
+    journal row in the same INSERT as the rest of the row. An operator (or the anonymous
+    caller with auth off) stamps ``None``, which the ``run:*`` rules read as operator-owned.
+    Starting a run is not itself gated: the stamp is what later cancel/resume/replay
+    decisions are made against.
 
     Tier dispatch (U5, A3, BR-8): ONE ``isinstance(spec, ScriptSpec)`` check,
     immediately after ``get_workflow`` resolves the spec — no downstream code
@@ -5965,6 +6010,7 @@ async def start_workflow_run_endpoint(
                 resolved,
                 run_id,
                 working_directory=root,
+                **_ownership_kwargs(principal),
             )
         except script_runner.ScriptLintError as e:
             raise HTTPException(
@@ -5992,7 +6038,9 @@ async def start_workflow_run_endpoint(
         return result.model_dump()
 
     try:
-        result = await workflow_service.start_run(spec, body.inputs, run_id)
+        result = await workflow_service.start_run(
+            spec, body.inputs, run_id, **_ownership_kwargs(principal)
+        )
     except NotBuiltYetError as e:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
     except KeyError as e:
@@ -6009,8 +6057,13 @@ async def start_workflow_run_endpoint(
 async def submit_workflow_run_endpoint(
     body: WorkflowRunRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Submit a workflow run asynchronously: durably record it, ack 202, drive in background.
+
+    #965 WS4: both tier arms stamp ``principal.terminal_id`` / ``principal.ancestors`` on
+    the durable INSERT at step 5 and on the live record at step 6 (same values, one write;
+    see the blocking twin's docstring).
 
     THE SPINE (U2, FR-2.1..FR-2.6). Unlike the blocking ``POST /workflows/runs``
     (untouched, byte-compatible), this route acks with **202** the instant the run
@@ -6121,6 +6174,8 @@ async def submit_workflow_run_endpoint(
     started_at = workflow_service._now()
     record: Any
     tier: str
+    # #965 WS4: the stamp, resolved once and written identically to the row and the record.
+    owner_terminal_id, ancestor_terminal_ids = _ownership_of(principal)
 
     # Steps 4-6 branch by tier via ONE ``isinstance`` check (mirrors the blocking
     # route's tier split). Each arm: (4) its pre-insert gate, which raises BEFORE
@@ -6202,6 +6257,9 @@ async def submit_workflow_run_endpoint(
                 # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
                 # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
                 manifest_json,
+                # #965 WS4: ownership rides the same INSERT (no window in which the row is unowned).
+                owner_terminal_id,
+                ancestor_terminal_ids,
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
@@ -6234,6 +6292,8 @@ async def submit_workflow_run_endpoint(
             finished_at=None,
             tier="script",
             working_directory=root,
+            owner_terminal_id=owner_terminal_id,
+            ancestor_terminal_ids=ancestor_terminal_ids,
         )
         tier = "script"
     else:
@@ -6261,6 +6321,10 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "yaml",
                 "1",
+                None,
+                # #965 WS4: ownership rides the same atomic INSERT as the run row and its steps.
+                owner_terminal_id,
+                ancestor_terminal_ids,
             )
         except sqlite3.IntegrityError:
             # Same TOCTOU → 409 mapping as the script arm above; ordered before the
@@ -6287,6 +6351,8 @@ async def submit_workflow_run_endpoint(
                 step.id: workflow_service.StepRunState(step_id=step.id) for step in spec.steps
             },
             started_at=started_at,
+            owner_terminal_id=owner_terminal_id,
+            ancestor_terminal_ids=ancestor_terminal_ids,
         )
         tier = "yaml"
 
@@ -7563,12 +7629,86 @@ async def get_workflow_run_result_endpoint(
     return body
 
 
+# ── run ownership gate (#965 WS4) ──────────────────────────────────────────
+#
+# The three run-scoped MUTATIONS below (cancel, resume, single-step replay) are
+# object-level authorization decisions (OWASP API1): the write scope answers "may this
+# caller cancel runs at all?", and nothing before WS4 answered "may it cancel THIS run?".
+# Every one of them now resolves the caller's principal and asks ``authorize()`` through
+# the ONE helper below; a hand-written owner comparison in a route is a bug, and
+# ``test/security/test_run_ownership_guard.py`` fails CI for any ``run_id`` route that
+# mutates a run without calling it.
+
+
+def _run_ownership_ref(run_id: str) -> Optional[RunRef]:
+    """Build the :class:`RunRef` the ``run:*`` rules decide against, or ``None`` if unknown.
+
+    The journal row is authoritative (ownership is frozen there at creation). The live
+    ``run_registry`` record is the fallback for a run whose best-effort journal insert
+    failed; it carries the same two fields, defaulted to "operator-owned" on a record
+    that predates them. ``None`` means the run exists nowhere, and the route's own
+    404 path answers — the gate never invents a second not-found shape.
+    """
+    from cli_agent_orchestrator.services import workflow_journal, workflow_service
+
+    row = workflow_journal.get_run(run_id)
+    if row is not None:
+        return RunRef(
+            run_id=run_id,
+            owner_terminal_id=row.owner_terminal_id,
+            ancestor_terminal_ids=tuple(row.ancestor_terminal_ids),
+        )
+    record = workflow_service.run_registry.get(run_id)
+    if record is None:
+        return None
+    return RunRef(
+        run_id=run_id,
+        owner_terminal_id=getattr(record, "owner_terminal_id", None),
+        ancestor_terminal_ids=tuple(getattr(record, "ancestor_terminal_ids", ()) or ()),
+    )
+
+
+def _authorize_run_action(principal: Principal, action: str, ref: RunRef) -> None:
+    """``check()`` a run action and, on refusal, name the OWNER in the 403.
+
+    ``check`` audits and (only under ``CAO_PRINCIPAL_ENFORCE``) raises with the rule's
+    reason, which names the caller. An operator reading the refusal needs to know whose
+    run they would have been killing, so the detail is rewritten to carry the owner's
+    terminal id as well. Terminal ids only — never the run's spec, prompt or inputs.
+    """
+    verb = action.partition(":")[2] or action
+    try:
+        check(principal, action, ref)
+    except HTTPException as e:
+        if e.status_code != status.HTTP_403_FORBIDDEN:
+            raise
+        who = (
+            f"terminal '{principal.terminal_id}'"
+            if principal.terminal_id
+            else f"{principal.kind} principal"
+        )
+        owner = (
+            f"is owned by terminal '{ref.owner_terminal_id}'"
+            if ref.owner_terminal_id
+            else "was started by an operator and has no owning terminal"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"run '{ref.run_id}' {owner}; {who} may not {verb} it",
+        )
+
+
 @app.post("/workflows/runs/{run_id}/cancel")
 async def cancel_workflow_run_endpoint(
     run_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Cooperatively cancel a running workflow (FR-5.4, U5 A5).
+
+    #965 WS4: gated by ``authorize(principal, run:cancel, RunRef)`` BEFORE any tier
+    dispatch — owner, frozen ancestor, operator, or the run's own principal; 403
+    naming the owner otherwise (warn mode: audit line, then proceed).
 
     Tier dispatch reads the LIVE ``run_registry`` record FIRST (BR-15) —
     ``getattr(record, "tier", "yaml")`` — because cancel's async/sync split is
@@ -7590,6 +7730,10 @@ async def cancel_workflow_run_endpoint(
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    ref = _run_ownership_ref(run_id)
+    if ref is not None:
+        _authorize_run_action(principal, RUN_CANCEL, ref)
 
     record = workflow_service.run_registry.get(run_id)
     if record is None:
@@ -7640,8 +7784,16 @@ async def resume_workflow_run_endpoint(
     run_id: str,
     body: Optional[ResumeRunRequest] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Resume a crashed/failed run from its durable journal (FR-6.2, N6, U5 A4).
+
+    #965 WS4: gated by ``authorize(principal, run:resume, RunRef)``. A resume from
+    another terminal is a NEW CALLER and nothing more: the owner is not re-stamped and
+    the resumer is not appended to the frozen ancestor list, so resuming a run never
+    transfers it and a stranger who could resume in warn mode still cannot cancel under
+    enforcement. Resume re-drives the journaled row with UPDATEs only; the two ownership
+    columns have no UPDATE path at all.
 
     Tier dispatch reads the run's **journaled** tier (``RunRow.tier``), NEVER
     by re-resolving a spec (BR-11) — the spec file may have moved/changed
@@ -7683,6 +7835,16 @@ async def resume_workflow_run_endpoint(
     row = workflow_journal.get_run(run_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    _authorize_run_action(
+        principal,
+        RUN_RESUME,
+        RunRef(
+            run_id=run_id,
+            owner_terminal_id=getattr(row, "owner_terminal_id", None),
+            ancestor_terminal_ids=tuple(getattr(row, "ancestor_terminal_ids", ()) or ()),
+        ),
+    )
 
     if row.tier == "script":
         try:
@@ -7758,8 +7920,15 @@ async def replay_workflow_step_endpoint(
     step_id: str,
     body: Optional[StepReplayRequest] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
 ) -> Dict:
     """Re-execute ONE step of a recorded run and return its live result (issue #640).
+
+    #965 WS4: gated by ``authorize(principal, run:replay, RunRef)`` with the same
+    owner / ancestor / operator rule as cancel. Replay writes nothing to the run, but
+    it reads the run's recorded prompts and outputs into a fresh agent, which is why
+    it is an owner-scoped action and not a read. An unknown run is left to the
+    service's own 404 (there is no row to decide against).
 
     Write-scoped because it creates a terminal and runs an agent — but READ-ONLY
     with respect to the run it replays: the service writes no journal row and emits
@@ -7786,6 +7955,10 @@ async def replay_workflow_step_endpoint(
     journal.
     """
     from cli_agent_orchestrator.services import workflow_service
+
+    ref = _run_ownership_ref(run_id)
+    if ref is not None:
+        _authorize_run_action(principal, RUN_REPLAY, ref)
 
     try:
         return await workflow_service.replay_single_step(

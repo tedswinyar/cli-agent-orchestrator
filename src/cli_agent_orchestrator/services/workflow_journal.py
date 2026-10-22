@@ -35,6 +35,7 @@ which is observably identical to the pre-extension shape.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -91,6 +92,9 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         "manifest_json",
         "error",
         "kind",
+        # Run ownership (#965 WS4): stamped at creation, read by the run:* authorize() rules.
+        "owner_terminal_id",
+        "ancestor_terminal_ids",
     }
 )
 _REQUIRED_STEP_COLUMNS = frozenset(
@@ -138,6 +142,15 @@ class RunRow:
     # later fail for an unrelated reason; this column keeps live and cold reads
     # aligned on the run's actual terminal kind.
     kind: Optional[str] = None
+    # #965 WS4, run ownership. ``owner_terminal_id`` is the terminal whose principal started
+    # the run (None for an operator, an anonymous caller with auth off, or a pre-WS4 row);
+    # ``ancestor_terminal_ids`` is that terminal's creator chain, nearest first, FROZEN at
+    # creation: it is never recomputed from the live terminals table and never widened by a
+    # resume, so a later re-parent cannot grow the set of terminals allowed to act on the run.
+    # Both are written exactly once, by the two INSERT helpers below; no UPDATE touches them
+    # (``test_run_ownership_guard.py`` asserts that).
+    owner_terminal_id: Optional[str] = None
+    ancestor_terminal_ids: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -386,6 +399,8 @@ def insert_run(
     tier: str = "yaml",
     generation: str = "1",
     manifest_json: Optional[str] = None,
+    owner_terminal_id: Optional[str] = None,
+    ancestor_terminal_ids: Sequence[str] = (),
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
 
@@ -401,13 +416,19 @@ def insert_run(
     script run passes ``tier='script'`` in ONE write so a script row is never
     journaled with a transient ``tier='yaml'`` window that would break tier
     dispatch / resumability (code-generation-plan CONTRADICTION #4).
+
+    #965 WS4: ``owner_terminal_id`` / ``ancestor_terminal_ids`` ride the SAME INSERT
+    (one write, no window in which the row exists unowned). Callers pass the starting
+    principal's ``terminal_id`` and ``ancestors``; the defaults keep every existing
+    caller byte-identical and record an operator-owned run.
     """
     with _connect() as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json, "
+            " owner_terminal_id, ancestor_terminal_ids) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -418,8 +439,37 @@ def insert_run(
                 tier,
                 generation,
                 manifest_json,
+                owner_terminal_id,
+                _encode_ancestors(ancestor_terminal_ids),
             ),
         )
+
+
+def _encode_ancestors(ancestor_terminal_ids: Sequence[str]) -> Optional[str]:
+    """JSON-encode the frozen ancestor list for the ``ancestor_terminal_ids`` column.
+
+    An empty chain is stored as NULL, not ``[]``, so an operator-started run and a
+    pre-WS4 row are indistinguishable on read (both decode to ``()``).
+    """
+    ids = [str(t) for t in ancestor_terminal_ids if t]
+    return json.dumps(ids, separators=(",", ":")) if ids else None
+
+
+def _decode_ancestors(raw: Optional[str]) -> Tuple[str, ...]:
+    """Decode the ``ancestor_terminal_ids`` column; anything but a JSON list of strings is ``()``.
+
+    Total: a corrupt cell must not turn a run read into a 500, and the fail-closed
+    direction for authorization is "no ancestor may act", which ``()`` is.
+    """
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(data, list):
+        return ()
+    return tuple(t for t in data if isinstance(t, str) and t)
 
 
 def insert_run_with_steps(
@@ -434,6 +484,8 @@ def insert_run_with_steps(
     tier: str = "yaml",
     generation: str = "1",
     manifest_json: Optional[str] = None,
+    owner_terminal_id: Optional[str] = None,
+    ancestor_terminal_ids: Sequence[str] = (),
 ) -> None:
     """Atomically INSERT the run row AND seed its step rows in ONE transaction (U2, TR-1).
 
@@ -458,13 +510,16 @@ def insert_run_with_steps(
     ``insert_run`` / ``insert_steps`` are deliberately left unchanged — the
     blocking engines still call them (INV-1). This is a NEW additive sibling that
     composes the same two INSERTs into one transaction for the async path.
+
+    #965 WS4: ownership columns ride the same INSERT as in :func:`insert_run`.
     """
     with _connect() as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json, "
+            " owner_terminal_id, ancestor_terminal_ids) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -475,6 +530,8 @@ def insert_run_with_steps(
                 tier,
                 generation,
                 manifest_json,
+                owner_terminal_id,
+                _encode_ancestors(ancestor_terminal_ids),
             ),
         )
         conn.executemany(
@@ -885,7 +942,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
             "current_step_id, started_at, finished_at, tier, generation, manifest_json, error, "
-            "kind FROM workflow_run WHERE run_id = ?",
+            "kind, owner_terminal_id, ancestor_terminal_ids FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
     if row is None:
@@ -906,6 +963,10 @@ def get_run(run_id: str) -> Optional[RunRow]:
         manifest_json=row[10],
         error=row[11],
         kind=row[12],
+        # #965 WS4: NULL on every pre-WS4 and operator-started row; both read as "no terminal
+        # owns this run", which the run:* rules resolve to operator-only.
+        owner_terminal_id=row[13],
+        ancestor_terminal_ids=_decode_ancestors(row[14]),
     )
 
 
