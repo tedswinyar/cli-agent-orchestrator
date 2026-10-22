@@ -22,6 +22,7 @@ from typing import Any, Iterable, Optional
 
 from fastapi import HTTPException, status
 
+from cli_agent_orchestrator.constants import DISCOVERY_TOOL_MARKER
 from cli_agent_orchestrator.security.principal import Principal
 
 logger = logging.getLogger(__name__)
@@ -56,12 +57,19 @@ _RUN_ACTIONS: frozenset[str] = frozenset({RUN_CANCEL, RUN_RESUME, RUN_REPLAY})
 
 #: Tools a terminal principal may always call on ``cao-mcp-server`` regardless
 #: of its allowlist: the callbacks a bounded agent needs to report back to its
-#: creator, and the discovery pair (#671 ruling, 2026-10-21).
+#: creator (#671 ruling, 2026-10-21; ``mcp_server.server.CALLBACK_EXEMPT_TOOLS``
+#: is this set).
 CALLBACK_TOOLS: frozenset[str] = frozenset(
     {"send_message", "complete_assignment", "workflow_return", "answer_user_prompt"}
 )
+#: The two tools the separate ``discovery`` grant covers independently of
+#: ``@cao-mcp-server`` (docs/tool-restrictions.md, "discovery is a separate
+#: opt-in"; #972's carve-out). They pass on that grant alone, and on nothing
+#: less: ``_require_discovery_marker`` still does the live check when they run.
 DISCOVERY_TOOLS: frozenset[str] = frozenset({"list_siblings", "update_metadata"})
-ALWAYS_ALLOWED_TOOLS: frozenset[str] = CALLBACK_TOOLS | DISCOVERY_TOOLS
+#: The allowlist entry that is the ``discovery`` grant, spelled the same way
+#: ``utils.orchestration.has_discovery_grant`` reads it.
+DISCOVERY_GRANT = DISCOVERY_TOOL_MARKER
 
 
 @dataclass(frozen=True)
@@ -119,6 +127,18 @@ def tool_covered(allowed: Iterable[str], tool: str, server: str) -> bool:
         if _selector_covers_server(entry, server):
             return True
     return False
+
+
+def discovery_granted(allowed: Iterable[str]) -> bool:
+    """Whether an effective allowlist carries the ``discovery`` grant (or ``*``).
+
+    The same test as ``utils.orchestration.has_discovery_grant`` for a resolved
+    list; ``None`` never reaches here because the gate treats an unresolvable
+    allowlist as unknown before building a principal.
+    """
+
+    entries = [a for a in allowed if isinstance(a, str)]
+    return "*" in entries or DISCOVERY_GRANT in entries
 
 
 def _entry_within_ceiling(entry: str, ceiling: Iterable[str]) -> bool:
@@ -180,9 +200,14 @@ def authorize(principal: Principal, action: str, resource: Any, **ctx: Any) -> D
         server = str(ctx.get("server", CAO_MCP_SERVER))
         if server == CAO_OPS_MCP_SERVER:
             return Decision(False, "fleet:operator-only", f"{who} may not call ops tool {tool}")
-        if server == CAO_MCP_SERVER and tool in ALWAYS_ALLOWED_TOOLS:
-            rule = "tool:callback" if tool in CALLBACK_TOOLS else "tool:discovery"
-            return Decision(True, rule, f"{tool} is always available to {who}")
+        if server == CAO_MCP_SERVER and tool in CALLBACK_TOOLS:
+            return Decision(True, "tool:callback", f"{tool} is always available to {who}")
+        if (
+            server == CAO_MCP_SERVER
+            and tool in DISCOVERY_TOOLS
+            and discovery_granted(principal.allowed_tools)
+        ):
+            return Decision(True, "tool:discovery", f"{who} holds the discovery grant for {tool}")
         if tool_covered(principal.allowed_tools, tool, server):
             return Decision(True, "tool:allowlist", f"{who} allowlist covers {tool}")
         return Decision(
@@ -243,18 +268,25 @@ def enforcing() -> bool:
     return os.getenv("CAO_PRINCIPAL_ENFORCE", "").strip().lower() in ("1", "true")
 
 
-def check(principal: Principal, action: str, resource: Any, **ctx: Any) -> Decision:
+def check(
+    principal: Principal, action: str, resource: Any, *, hard: bool = False, **ctx: Any
+) -> Decision:
     """Authorize, audit, and (only when enforcing) refuse with HTTP 403.
 
     This is the call call sites use. In warn mode the decision is recorded and
     returned without raising, so a denied call proceeds exactly as it does
     today while the audit log shows what enforcement *would* have refused.
+
+    ``hard=True`` enforces this one call whatever the flag says, and the audit
+    line records ``enforced: true``. It is for rules that were already behaviour
+    before ``CAO_PRINCIPAL_ENFORCE`` existed (the ``cao-mcp-server`` allowlist
+    gate #972 shipped), so the flag never relaxes them; see ``tool_gate.hard``.
     """
 
     from cli_agent_orchestrator.security import audit
 
     decision = authorize(principal, action, resource, **ctx)
-    enforce = enforcing()
+    enforce = hard or enforcing()
     audit.record(principal, action, _resource_repr(resource, ctx), decision, enforce)
     if not decision.allowed:
         if enforce:

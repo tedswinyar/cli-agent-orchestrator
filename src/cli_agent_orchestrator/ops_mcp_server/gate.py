@@ -68,12 +68,14 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         return tool_gate.unresolved(
             tool_name,
             f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})",
+            server=CAO_OPS_MCP_SERVER,
         )
     if record is None:
         return tool_gate.unresolved(
             tool_name,
             f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
             "terminal could not be resolved",
+            server=CAO_OPS_MCP_SERVER,
         )
 
     context = {

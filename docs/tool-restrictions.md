@@ -111,12 +111,16 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `fs_*` | All filesystem ops | All of the above | All of the above |
 | `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
 | `@builtin` | Selector naming the provider's own built-in tool set; **grants nothing by itself** on any provider. Kept in the role defaults for readability; list `fs_*`/`execute_bash` explicitly for the access you want | (no-op) | (no-op) |
-| `@cao-mcp-server` | Every tool on CAO's own MCP server (`handoff`, `assign`, the memory, outcome and workflow tools, ...). Server-level grant, enforced by CAO at the MCP boundary; see [The host-layer gate](#the-host-layer-gate-every-cao-mcp-tool) | Same |
-| `@cao-mcp-server/<tool>` | One named CAO MCP tool (for example `@cao-mcp-server/memory_recall`) without granting the rest of the server | Same |
+| `@cao-mcp-server` | Every CAO MCP tool: `handoff`, `assign`, `send_message`, Hermes prompt answers via `answer_user_prompt`, memory (`memory_store`/`memory_recall`/`memory_forget`), workflows, `delete_terminal`, and the rest of the `cao-mcp-server` surface. Server-level grant, enforced by CAO at the MCP boundary; see [The host-layer gate](#the-host-layer-gate-every-cao-mcp-tool) | Same | Same |
+| `@cao-mcp-server/<tool>` | One named CAO MCP tool (for example `@cao-mcp-server/memory_recall`) without granting the rest of the server | Same | Same |
 | `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
 CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
+
+#### `@cao-mcp-server` gates the whole CAO MCP tool surface, not just delegation
+
+Every tool `cao-mcp-server` registers is denied to a bound terminal whose effective allowlist omits `@cao-mcp-server` and `*` (#671) — not only the delegation tools (`assign`, `handoff`, `assign_elastic`, the `workflow_run` family, `create_ephemeral_agent`) that carried their own check before this. A single `on_call_tool` middleware enforces this once, ahead of every tool, so a tool registered later is covered by default. Four tools stay reachable regardless of the grant because they are the callback protocol an assigned worker depends on to report back and cannot be mistaken for a capability: `send_message`, `complete_assignment`, `workflow_return`, `answer_user_prompt`. The two `discovery`-gated tools (`list_siblings`, `update_metadata`) pass this gate on `discovery` alone, per the carve-out below — they do not need `@cao-mcp-server` too. This gate covers `cao-mcp-server` only; `cao-ops-mcp-server` (the inbound control-plane server for external agents — see [Control Planes](control-planes.md)) is operator-granted and out of its scope — it has its own operator-only gate, behind `CAO_PRINCIPAL_ENFORCE`, described under [The host-layer gate](#the-host-layer-gate-every-cao-mcp-tool) below.
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 
@@ -231,8 +235,9 @@ CAO therefore gates **every tool on both of its MCP servers** at the boundary ([
   denial instead of a quiet grant.
 - **Two exception sets stay, named explicitly.** The worker callbacks `send_message`,
   `complete_assignment`, `workflow_return` and `answer_user_prompt`, without which an assigned child
-  could never report back; and `list_siblings` / `update_metadata`, which keep their own
-  `discovery` grant. These are always available to a bound terminal.
+  could never report back, are always available to a bound terminal (`security.authz.CALLBACK_TOOLS`).
+  `list_siblings` / `update_metadata` pass on their own `discovery` grant alone, without
+  `@cao-mcp-server` (`security.authz.DISCOVERY_TOOLS`), and on nothing less.
 - **The effective list is the one CAO already has.** It is the terminal's recorded `allowedTools`, or
   the profile resolution that an unrecorded value stands for: the same list `--allowed-tools`, `role`
   defaults and `--yolo` produce, not a second allowlist. The grant is `*`, `@cao-mcp-server`, a glob
@@ -246,28 +251,34 @@ CAO therefore gates **every tool on both of its MCP servers** at the boundary ([
   an identity, anything that stops it being resolved (an unreachable or unauthorized cao-server, an
   unregistered terminal, an unreadable profile) refuses the call rather than allowing it.
 
-**How it is wired.** Every `@mcp.tool` registration on both servers stacks a gate decorator
-directly under it, so the object the server registers is the gated wrapper and no tool is reachable
-without the check; a structural test (`test/security/test_tool_gate_census.py`) walks the source and
-fails with `file:line` for any bare registration, and freezes the tool table so a new tool has to be
-gated deliberately. The decision itself is computed once, by `security.authz.authorize()`, from a
-principal built from the terminal record; the gate never compares allowlists itself. See
-[Agent principal](security/agent-principal.md) for the principal model and the rule table.
+**How it is wired.** On `cao-mcp-server` the gate is one FastMCP `on_call_tool` middleware
+(`_install_allowlist_middleware`, installed after every tool and plugin surface is registered), so a
+tool added later is covered by default and each dispatch is decided once. The six delegation tools
+(`assign`, `handoff`, `assign_elastic`, `workflow_run`, `workflow_resume`, `workflow_start`)
+additionally carry the gate as a decorator under `@mcp.tool`, because their callers pin a structured
+`success: false` / `ok: false` refusal and a direct call (the `cao` CLI paths) never passes through
+the middleware. On `cao-ops-mcp-server` every `@mcp.tool` registration stacks the gate decorator
+directly under it. A structural test (`test/security/test_tool_gate_census.py`) checks both
+arrangements from the source and freezes both tool tables so a new tool has to be gated
+deliberately; `test/mcp_server/test_mcp_tool_surface_gate_coverage.py` drives the installed
+middleware against the live registry. The decision itself is computed once, by
+`security.authz.authorize()`, from a principal built from the terminal record; neither gate compares
+allowlists itself. See [Agent principal](security/agent-principal.md) for the principal model and
+the rule table.
 
-**Warn mode and enforcement.** The gate is behind `CAO_PRINCIPAL_ENFORCE`:
+**Warn mode and enforcement.** Refusals on `cao-mcp-server` are hard: #972 shipped that gate as
+behaviour, so `CAO_PRINCIPAL_ENFORCE` does not relax it. The flag governs the ops server:
 
 | | `CAO_PRINCIPAL_ENFORCE` unset (default, warn mode) | `CAO_PRINCIPAL_ENFORCE=1` |
 |---|---|---|
-| `assign`, `handoff`, `assign_elastic`, `workflow_run`, `workflow_resume`, `workflow_start` | refused, as they have been since #769 | refused |
-| every other `cao-mcp-server` tool | allowed; the would-be refusal is written to `CAO_HOME_DIR/logs/authz.jsonl` | refused with the rule and reason (`'memory_forget' is not permitted (tool:default-deny): terminal a1b2c3d4 allowed_tools does not cover memory_forget on cao-mcp-server. Grant '@cao-mcp-server' ...`) |
-| every `cao-ops-mcp-server` tool, bound terminal | allowed; audited | refused (`fleet:operator-only`) |
+| `assign`, `handoff`, `assign_elastic`, `workflow_run`, `workflow_resume`, `workflow_start` | refused, as they have been since #769, with their established `success: false` / `ok: false` envelopes | same |
+| every other `cao-mcp-server` tool | refused as an MCP tool error with the rule and reason (`'memory_forget' is not permitted (tool:default-deny): terminal a1b2c3d4 allowed_tools does not cover memory_forget on cao-mcp-server. Grant '@cao-mcp-server' ...`) | same |
+| every `cao-ops-mcp-server` tool, bound terminal | allowed; the would-be refusal is written to `CAO_HOME_DIR/logs/authz.jsonl` | refused (`fleet:operator-only`) |
 | any tool, no `CAO_TERMINAL_ID` (operator) | allowed, no lookup | allowed, no lookup |
 
-Run in warn mode first and read the audit log: each line names the terminal, the tool, the rule and
-the reason, so a profile that would break under enforcement shows up before anything is refused.
-The refusal an agent sees in enforce mode is an MCP tool error carrying that same text, except for
-the six pre-existing refusals above, which keep their established `success: false` / `ok: false`
-envelopes.
+Every decision is audited: each line names the terminal, the tool, the rule, the reason and whether
+it was enforced, so a profile that pairs the ops server with an agent shows up in warn mode before
+anything is refused.
 
 Installed workflow callers with an explicit restricted allowlist must include `@cao-mcp-server` (or
 the specific `@cao-mcp-server/workflow_*` entries) to execute or resume workflows; installed profiles
@@ -445,7 +456,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Agent`/`Monitor`/`BashOutput`/`KillShell` execution family), `Read`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. The subagent tool is intentionally **not** a separate category: it is folded into `execute_bash`, because a subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Claude Code **renamed this tool from `Task` to `Agent`**, so both names are denied — current builds expose only `Agent`, so denying just `Task` would be a silent no-op. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
 
-2. **Providers expose the whole server; CAO gates it per call.** No provider blocks individual MCP tools: once `cao-mcp-server` is in a profile's `mcpServers`, every tool on it is *exposed* to the agent. Grok restricted profiles translate `@cao-mcp-server` to an allow rule for the configured server; other providers treat it as an intent marker. What holds is the host-layer gate above: a tool call from a bound terminal whose allowlist does not cover it is refused by CAO at the MCP boundary (hard today for the delegation tools, under `CAO_PRINCIPAL_ENFORCE` for the rest). Per-tool grants use `@cao-mcp-server/<tool>`. `answer_user_prompt` is always available to a bound terminal, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states.
+2. **Providers expose the whole server; CAO gates it per call.** No provider blocks individual MCP tools: once `cao-mcp-server` is in a profile's `mcpServers`, every tool on it is *exposed* to the agent. Grok restricted profiles translate `@cao-mcp-server` to an allow rule for the configured server; other providers treat it as an intent marker. What holds is the host-layer gate above: a tool call from a bound terminal whose allowlist does not cover it is refused by CAO at the MCP boundary (hard for every tool on `cao-mcp-server`; the `cao-ops-mcp-server` operator-only gate is behind `CAO_PRINCIPAL_ENFORCE`). Per-tool grants use `@cao-mcp-server/<tool>`. `answer_user_prompt` is always available to a bound terminal, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states.
 
 3. **Soft enforcement is best-effort.** The prompt-only providers in the table above (Kimi CLI, MiniMax Code, Codex, Antigravity CLI, OMP) rely on prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 

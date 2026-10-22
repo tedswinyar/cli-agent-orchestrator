@@ -1,28 +1,37 @@
-"""Structural guard: every MCP tool on both servers is wrapped by the host-layer gate (#671).
+"""Structural guard: every MCP tool on both servers sits behind the host-layer gate (#671).
 
-The gate is a decorator stacked directly under ``@mcp.tool``. That makes the
-invariant visible in source, so this census reads the source rather than
-trusting a runtime registry: for every ``@mcp.tool`` registration in the three
-modules that register tools on ``cao-mcp-server`` and ``cao-ops-mcp-server`` it
-asserts the gate decorator is present and is the decorator immediately below
-``@mcp.tool`` (the object FastMCP registers is the gated wrapper, not the bare
-function). A bare registration fails with ``file:line``.
+Two arrangements, one invariant (no tool is reachable without ``check()``):
+
+* ``cao-mcp-server``: the gate is #972's ``_AllowlistGate`` middleware, which
+  asks ``_tool_denied_reason`` once per dispatch, installed after every tool and
+  plugin surface is registered (``test/mcp_server/test_mcp_tool_surface_gate_coverage.py``
+  drives it against the live registry). The six delegation tools ALSO stack
+  ``@_gated(refuse=...)`` directly under ``@mcp.tool``: they were refused on main
+  before the middleware existed, their callers pin a structured envelope, and a
+  direct call (the ``cao`` CLI paths) never passes through the middleware. No
+  other registration may carry the decorator, so nothing is decided twice and
+  the record fetch happens once.
+* ``cao-ops-mcp-server``: no middleware on main (it is the operator control
+  plane), so every ``@mcp.tool`` registration in ``server.py`` and
+  ``decision_tools.py`` stacks ``@gated`` directly under it. A bare registration
+  fails with ``file:line``.
 
 The registration tables are frozen on purpose. Adding a tool is supposed to
-fail here once so the author gates it and adds it to the table; a missed
-exception is a loud failure instead of a quiet grant. The #671 census counted
-34 unique tools on ``cao-mcp-server`` on main; this table has the same 34.
+fail here once so the author decides which arrangement covers it and adds it to
+the table; a missed exception is a loud failure instead of a quiet grant. The
+#671 census counted 34 unique tools on ``cao-mcp-server`` on main; this table
+has the same 34.
 
 A runtime census complements the source walk: it lists the tools each live
-server exposes and asserts each one's bound function carries the gate marker,
-which also covers registrations made through ``add_tool`` or a plugin hook.
+server exposes and checks the gate marker against the arrangement above, which
+also covers registrations made through ``add_tool`` or a plugin hook.
 """
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import pytest
 
@@ -86,9 +95,22 @@ EXPECTED_CAO_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+#: The registrations on ``cao-mcp-server`` that stack ``@_gated(refuse=...)``:
+#: refused on main since #769 with envelopes their callers pin.
+CAO_DECORATED_TOOLS: frozenset[str] = frozenset(
+    {
+        "assign",
+        "handoff",
+        "assign_elastic",
+        "workflow_run",
+        "workflow_resume",
+        "workflow_start",
+    }
+)
+
 #: Not an ``@mcp.tool`` registration: added through ``add_tool`` on operator
 #: opt-in with a custom ``Tool`` whose ``run`` calls the binder below. The
-#: binder is the one place the gate can sit for it.
+#: binder is the one place the gate can sit for it besides the middleware.
 EPHEMERAL_TOOL = "create_ephemeral_agent"
 EPHEMERAL_BINDER = "_create_ephemeral_from_arguments"
 
@@ -141,7 +163,13 @@ def _registrations(path: Path) -> List[Tuple[str, int, List[str]]]:
     return found
 
 
-def _bare_registrations(server: str) -> List[str]:
+def _arrangement_violations(server: str, must_carry: Callable[[str], bool]) -> List[str]:
+    """Violations of the gate arrangement for ``server``.
+
+    ``must_carry(name)`` says whether a registration must stack the gate
+    decorator directly under ``@mcp.tool``; a registration that must not is
+    checked for the decorator's absence.
+    """
     gate, modules = REGISTRATION_MODULES[server]
     violations: List[str] = []
     for path in modules:
@@ -149,10 +177,18 @@ def _bare_registrations(server: str) -> List[str]:
         for name, lineno, names in _registrations(path):
             position = names.index("mcp.tool")
             below = names[position + 1 :]
-            if not below or below[0] != gate:
+            carries = bool(below) and below[0] == gate
+            if must_carry(name) and not carries:
                 violations.append(
                     f"{rel}:{lineno} @mcp.tool {name} is not wrapped by @{gate} "
                     f"(decorators: {names}); stack @{gate} directly under @mcp.tool"
+                )
+            elif not must_carry(name) and gate in names:
+                violations.append(
+                    f"{rel}:{lineno} @mcp.tool {name} carries @{gate} but the "
+                    f"_AllowlistGate middleware already gates it (#972); deciding twice "
+                    f"doubles the terminal-record fetch. Remove the decorator, or add the "
+                    f"tool to CAO_DECORATED_TOOLS with the envelope its callers pin."
                 )
     return violations
 
@@ -170,10 +206,41 @@ def test_registration_modules_exist_and_register_tools(server: str) -> None:
     assert _names(server), f"no @mcp.tool registrations found for {server}"
 
 
-@pytest.mark.parametrize("server", sorted(REGISTRATION_MODULES))
-def test_every_registration_is_wrapped_by_the_gate(server: str) -> None:
-    violations = _bare_registrations(server)
-    assert not violations, f"ungated tools on {server}:\n" + "\n".join(violations)
+def test_every_ops_registration_is_wrapped_by_the_gate() -> None:
+    violations = _arrangement_violations(CAO_OPS_MCP_SERVER, lambda name: True)
+    assert not violations, f"ungated tools on {CAO_OPS_MCP_SERVER}:\n" + "\n".join(violations)
+
+
+def test_cao_delegation_tools_carry_the_decorator_and_nothing_else_does() -> None:
+    violations = _arrangement_violations(CAO_MCP_SERVER, lambda name: name in CAO_DECORATED_TOOLS)
+    assert not violations, f"gate arrangement broken on {CAO_MCP_SERVER}:\n" + "\n".join(violations)
+
+
+def test_cao_decorated_set_is_the_legacy_hard_set() -> None:
+    """The decorator sits exactly on the tools #769 refused; the table and the mode agree."""
+    assert CAO_DECORATED_TOOLS == tool_gate.LEGACY_HARD_GATED - {EPHEMERAL_TOOL}
+
+
+def test_cao_middleware_is_installed_after_plugin_registration() -> None:
+    """#972's gate wraps every registration, including a plugin's, and asks the policy by name."""
+    source = (_PACKAGE_ROOT / "mcp_server" / "server.py").read_text(encoding="utf-8")
+    register = source.index("\nregister_mcp_server_surfaces(mcp)")
+    install = source.index("\n_install_allowlist_middleware(mcp)")
+    assert register < install
+    tree = ast.parse(source)
+    installer = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_install_allowlist_middleware"
+    )
+    args = {
+        a.id
+        for n in ast.walk(installer)
+        if isinstance(n, ast.Call)
+        for a in n.args
+        if isinstance(a, ast.Name)
+    }
+    assert "_tool_denied_reason" in args, "the middleware must ask _tool_denied_reason"
 
 
 def test_cao_mcp_server_registration_table_is_frozen() -> None:
@@ -181,9 +248,9 @@ def test_cao_mcp_server_registration_table_is_frozen() -> None:
     assert names == EXPECTED_CAO_TOOLS, (
         "cao-mcp-server tool table changed. added="
         f"{sorted(names - EXPECTED_CAO_TOOLS)} removed={sorted(EXPECTED_CAO_TOOLS - names)}. "
-        "A new tool must stack @_gated under @mcp.tool and be added to EXPECTED_CAO_TOOLS; "
-        "if it needs to bypass the allowlist, that is an authz.ALWAYS_ALLOWED_TOOLS ruling, "
-        "not a bare registration."
+        "A new tool is gated by the _AllowlistGate middleware by default; add it to "
+        "EXPECTED_CAO_TOOLS. If it must bypass the allowlist, that is an "
+        "authz.CALLBACK_TOOLS ruling, not a bare registration."
     )
     assert len(names) == 34, "the #671 census counted 34 unique tools on main"
 
@@ -228,14 +295,18 @@ def test_ephemeral_binder_calls_the_gate() -> None:
 
 @pytest.mark.asyncio
 async def test_live_servers_expose_only_gated_functions() -> None:
-    """Runtime census: every tool FastMCP lists is bound to a gated wrapper."""
+    """Runtime census: every tool FastMCP lists is covered by its server's arrangement."""
 
     from cli_agent_orchestrator.mcp_server import server as cao_server
     from cli_agent_orchestrator.ops_mcp_server import server as ops_server
 
-    for server_name, module, expected in (
-        (CAO_MCP_SERVER, cao_server, EXPECTED_CAO_TOOLS),
-        (CAO_OPS_MCP_SERVER, ops_server, EXPECTED_OPS_TOOLS),
+    assert any(
+        type(m).__name__ == "_AllowlistGate" for m in getattr(cao_server.mcp, "middleware", [])
+    ), "cao-mcp-server has no _AllowlistGate middleware installed"
+
+    for server_name, module, expected, decorated in (
+        (CAO_MCP_SERVER, cao_server, EXPECTED_CAO_TOOLS, CAO_DECORATED_TOOLS),
+        (CAO_OPS_MCP_SERVER, ops_server, EXPECTED_OPS_TOOLS, EXPECTED_OPS_TOOLS),
     ):
         tools = await module.mcp.list_tools()
         listed = {t.name for t in tools}
@@ -248,6 +319,8 @@ async def test_live_servers_expose_only_gated_functions() -> None:
             if fn is None:
                 assert tool.name == EPHEMERAL_TOOL, f"{server_name}/{tool.name} has no bound fn"
                 continue
-            assert tool_gate.is_gated(
-                fn, server_name
-            ), f"{server_name}/{tool.name} is exposed without the host-layer gate"
+            assert tool_gate.is_gated(fn, server_name) == (tool.name in decorated), (
+                f"{server_name}/{tool.name}: decorator "
+                f"{'missing' if tool.name in decorated else 'present'} "
+                f"(expected {'present' if tool.name in decorated else 'absent'})"
+            )

@@ -34,7 +34,11 @@ from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.security import tool_gate
-from cli_agent_orchestrator.security.authz import CAO_MCP_SERVER
+from cli_agent_orchestrator.security.authz import (
+    CALLBACK_TOOLS,
+    CAO_MCP_SERVER,
+    DISCOVERY_TOOLS,
+)
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
@@ -43,10 +47,7 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
-from cli_agent_orchestrator.services.outcome_service import (
-    LEARNING_DISABLED_CODE,
-    LEARNING_DISABLED_MESSAGE,
-)
+from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_CODE
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.caller_tools import (
     caller_effective_allowed_tools as _caller_effective_allowed_tools,
@@ -92,10 +93,17 @@ mcp = FastMCP(
     """,
 )
 
-# Every ``@mcp.tool`` registration in this module stacks ``@_gated`` directly under
-# it, so the object FastMCP registers is the gated wrapper and no tool is reachable
-# without ``_tool_denied_reason`` (#671). ``test/security/test_tool_gate_census.py``
-# fails with file:line for any registration that lacks it. The lambda resolves
+# The host-layer gate for this server is ONE FastMCP middleware
+# (``_install_allowlist_middleware``, installed last at the bottom of this module),
+# which asks ``_tool_denied_reason`` before every tool dispatch (#671, #972). The
+# decorator below is stacked under ``@mcp.tool`` ONLY on the six delegation tools
+# (``assign``, ``handoff``, ``assign_elastic``, ``workflow_run``, ``workflow_resume``,
+# ``workflow_start``): they were refused before the middleware existed and their
+# callers and tests pin a structured ``success: false`` / ``ok: false`` envelope,
+# which a direct call (``cao`` CLI paths, the test-suite) must still receive without
+# passing through FastMCP dispatch. Every other tool relies on the middleware alone,
+# so a tool added later is gated by default and nothing is decided twice.
+# ``test/security/test_tool_gate_census.py`` pins both halves. The lambda resolves
 # ``_tool_denied_reason`` by name at call time so tests that monkeypatch it hold.
 _gated = tool_gate.gated(lambda name: _tool_denied_reason(name), server=CAO_MCP_SERVER)
 
@@ -941,7 +949,6 @@ async def assign_elastic(
 
 # Implementation function for send_message
 @mcp.tool()
-@_gated
 async def send_message(
     message: str = Field(description="Message content to send"),
     receiver_id: Optional[str] = Field(
@@ -977,7 +984,6 @@ async def send_message(
 
 
 @mcp.tool()
-@_gated
 async def complete_assignment(
     message: str = Field(description="Final result to deliver to the assigning supervisor"),
 ) -> Dict[str, Any]:
@@ -1020,7 +1026,6 @@ async def complete_assignment(
 
 
 @mcp.tool()
-@_gated
 async def emit_ui(
     component: str = Field(
         description=(
@@ -1069,7 +1074,6 @@ async def emit_ui(
 
 
 @mcp.tool()
-@_gated
 async def answer_user_prompt(
     terminal_id: str = Field(description="Target terminal ID waiting for user input"),
     answer: str = Field(
@@ -1088,7 +1092,6 @@ async def answer_user_prompt(
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)
-@_gated
 async def load_skill(
     name: str = Field(description="Name of the skill to retrieve"),
 ) -> Any:
@@ -1097,7 +1100,6 @@ async def load_skill(
 
 
 @mcp.tool()
-@_gated
 def delete_terminal(
     terminal_id: str = Field(
         description="The terminal ID to delete (obtained from assign or handoff results)"
@@ -1153,7 +1155,6 @@ def delete_terminal(
 
 
 @mcp.tool()
-@_gated
 def get_handoff_result(
     job_id: str = Field(
         description=(
@@ -1372,7 +1373,6 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
-@_gated
 async def list_siblings(
     depth: Optional[int] = Field(
         default=None,
@@ -1431,7 +1431,6 @@ async def list_siblings(
 
 
 @mcp.tool()
-@_gated
 async def update_metadata(
     metadata: Dict[str, Any] = Field(
         description=(
@@ -1467,7 +1466,6 @@ async def update_metadata(
 
 
 @mcp.tool()
-@_gated
 def find_profiles(
     query: str = Field(
         description="Free-text keywords describing the capability you need (e.g. 'monitor sqs')"
@@ -1570,60 +1568,57 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
-    """True when the caller's PROFILE declares the ``store_lesson`` capability.
-
-    Server-side authorization for cross-agent lesson writes: the profile name
-    comes from the terminal's registered record (never tool arguments), and
-    the capability list comes from the profile file's frontmatter — an
-    operator-owned artifact a worker cannot edit through MCP. Fails closed on
-    any lookup error.
-    """
-    if not caller_profile:
-        return False
-    try:
-        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-
-        profile = load_agent_profile(caller_profile)
-        return "store_lesson" in (profile.capabilities or [])
-    except Exception as e:  # noqa: BLE001 — authz check fails closed
-        logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
-        return False
-
-
 CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
+
+#: ``list_siblings``/``update_metadata`` are gated by their own live
+#: ``discovery`` check (``_require_discovery_marker`` above), not by
+#: ``@cao-mcp-server`` -- docs/tool-restrictions.md: "A profile with
+#: @cao-mcp-server does not automatically get sibling discovery, and vice
+#: versa." Letting the two tools in this set through on ``discovery`` alone
+#: (in addition to ``*``/``@cao-mcp-server``) keeps that documented,
+#: independently-grantable surface reachable; ``_require_discovery_marker``
+#: still does the real enforcement when the tool actually runs. The set itself
+#: is ``security.authz.DISCOVERY_TOOLS``: the ``tool:discovery`` rule there is
+#: what ``_tool_denied_reason`` decides with, so the two cannot drift.
+DISCOVERY_GATED_TOOLS = DISCOVERY_TOOLS
 
 
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal may not call ``tool_name``, or None to proceed.
 
-    The host-layer gate for every tool on ``cao-mcp-server`` (#671). Each
-    ``@mcp.tool`` registration stacks ``@_gated`` under it, which calls this
-    by name before the body runs; the decision itself comes from
-    :func:`security.authz.check` through :mod:`security.tool_gate`, never
-    from a comparison written here.
+    The policy behind the host-layer gate for every tool on ``cao-mcp-server``
+    (#671). The ``_AllowlistGate`` middleware calls this by name before any tool
+    dispatches (and the ``@_gated`` decorator does the same for a direct call of
+    a delegation tool); the decision itself comes from
+    :func:`security.authz.check` through :mod:`security.tool_gate`, never from a
+    comparison written here.
 
-    Policy (the #671 ruling): for a bound terminal, omitting ``@cao-mcp-server``
-    denies every tool on this server by default. Two exception sets stay and are
-    named in ``authz``: the worker callbacks (``send_message``,
-    ``complete_assignment``, ``workflow_return``, ``answer_user_prompt``) and the
-    discovery pair (``list_siblings``, ``update_metadata``). The per-tool form
-    ``@cao-mcp-server/<tool>`` grants one tool; a bare tool name never names an
-    MCP tool, because bare names are provider-native vocabulary.
+    Policy (the #671 ruling, as #972 shipped it): for a bound terminal, omitting
+    ``@cao-mcp-server`` denies every tool on this server by default. The
+    authorization model is the one CAO already has, not a second one: the grant
+    is the documented ``@cao-mcp-server`` server selector, ``*``, or the
+    per-tool form ``@cao-mcp-server/<tool>``; a bare tool name never names an
+    MCP tool, because bare names are provider-native vocabulary. Two exception
+    sets are named in ``authz``: the worker callbacks (``CALLBACK_TOOLS``:
+    ``send_message``, ``complete_assignment``, ``workflow_return``,
+    ``answer_user_prompt``), which a bound terminal may always call, and the
+    discovery pair (``DISCOVERY_TOOLS``: ``list_siblings``, ``update_metadata``),
+    which also passes on the ``discovery`` grant alone because that grant is
+    documented as independent of ``@cao-mcp-server``.
 
     Identity. The effective list is the terminal's recorded ``allowed_tools``,
     or the profile resolution that ``None`` stands for, exactly as
     ``create_terminal`` computes it. An unset ``CAO_TERMINAL_ID`` is the
     supported operator context (``cao assign`` / ``cao handoff`` run with no
     caller identity) and is never looked up. Once the caller claims an identity
-    every failure to resolve it is an unknown, and an unknown does not dispatch
-    (see ``tool_gate.unresolved`` for the warn-mode carve-out).
+    every failure to resolve it is an unknown, and an unknown does not dispatch:
+    a malformed ID, an unreachable or unauthorized cao-server, a terminal that
+    is not registered, an unreadable profile.
 
-    Enforcement. ``assign``, ``handoff``, ``assign_elastic``, ``workflow_run``,
-    ``workflow_resume`` and ``workflow_start`` were refused on main before the
-    flag existed and stay hard. Every other tool refuses only under
-    ``CAO_PRINCIPAL_ENFORCE``; in warn mode (default) ``check`` audits the
-    would-be refusal to ``CAO_HOME_DIR/logs/authz.jsonl`` and the call proceeds.
+    Enforcement. Every denial on this server is hard, whatever
+    ``CAO_PRINCIPAL_ENFORCE`` says: #972 shipped the whole-surface gate on main
+    as behaviour, so the flag relaxes nothing here (``tool_gate.hard``). Each
+    decision is still audited to ``CAO_HOME_DIR/logs/authz.jsonl`` by ``check``.
 
     Ephemeral policy (``max_depth``, ``child_may_delegate``) is not an allowlist
     rule and is applied here before the allowlist, unchanged.
@@ -1638,6 +1633,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         return tool_gate.unresolved(
             tool_name,
             f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})",
+            server=CAO_MCP_SERVER,
         )
 
     if context is None:
@@ -1645,6 +1641,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             tool_name,
             f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
             "terminal could not be resolved",
+            server=CAO_MCP_SERVER,
         )
 
     if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
@@ -1674,16 +1671,98 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             tool_name,
             f"cannot authorize '{tool_name}': the caller's allowed tools could not "
             f"be resolved ({e})",
+            server=CAO_MCP_SERVER,
         )
 
     if allowed is None:
         return tool_gate.unresolved(
             tool_name,
             f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved",
+            server=CAO_MCP_SERVER,
         )
 
+    # ``*`` / ``@cao-mcp-server`` / ``@cao-mcp-server/<tool>`` (tool:allowlist) and
+    # the ``discovery`` carve-out for ``DISCOVERY_GATED_TOOLS`` (tool:discovery)
+    # are rules in ``security.authz.authorize``, not comparisons written here.
     principal = tool_gate.principal_for(context, allowed)
     return tool_gate.denial_for(principal, tool_name, server=CAO_MCP_SERVER)
+
+
+#: CAO MCP tools a bound terminal must reach whatever its allowlist says.
+#:
+#: These are the callback protocol, not capabilities. ``skills/cao-worker-protocols``
+#: tells an ASSIGNED worker to report its result with ``send_message`` and no
+#: ``receiver_id`` ("The requesting terminal depends on ``send_message`` to receive
+#: the result"), and ``_resolve_child_allowed_tools`` gives a child whose profile
+#: declares ``tools: [fs_read]`` exactly ``["fs_read"]``. Gating these on
+#: ``@cao-mcp-server`` would therefore leave a restricted worker unable to report
+#: and its supervisor waiting forever — CAO would deadlock its own orchestration to
+#: enforce a restriction the operator asked for on the worker's *capabilities*.
+#:
+#: Each entry answers upward to the terminal that created the caller, carries no
+#: authority over any other identity, and cannot mint one. Keep this set this small:
+#: a tool belongs here only if a worker CANNOT COMPLETE ITS OWN ASSIGNED WORK
+#: without it. "It would be convenient" is what produced #671.
+#:
+#: The set is ``security.authz.CALLBACK_TOOLS`` (the ``tool:callback`` rule), so
+#: the middleware's skip and the policy's allow name the same four tools.
+CALLBACK_EXEMPT_TOOLS = CALLBACK_TOOLS
+
+
+def _install_allowlist_middleware(server: Any) -> None:
+    """Gate every CAO MCP tool on the caller's allowlist (#671).
+
+    #769 and #811 put ``_tool_denied_reason`` on the tools that mint a new agent
+    identity. That closed the escalation path and left the rest of the surface
+    open: a bound terminal whose effective allowlist omits ``@cao-mcp-server``
+    could still call ``memory_store``, ``memory_forget``, ``delete_terminal``,
+    ``update_metadata``, ``workflow_cancel`` and the rest, because the only other
+    enforcement mechanism — the provider-native deny flags built by
+    ``utils/tool_mapping`` — cannot name an MCP tool at all:
+    ``get_disallowed_tools`` skips every ``@``-prefixed entry, so it emits no
+    ``mcp__`` name on any provider.
+
+    One rule, applied here rather than at 26 more call sites, because per-site
+    guards are exactly how the surface drifted in the first place and a tool added
+    tomorrow would be ungated by default. The policy is unchanged:
+    ``_tool_denied_reason`` is the single source of it, so an operator context
+    (no ``CAO_TERMINAL_ID``) still allows, ``*`` or ``@cao-mcp-server`` still
+    grants, and every failure to resolve a claimed identity still denies.
+
+    Registered AFTER the MCP Apps surface so an app-only tool is reported as
+    unknown by its own filter rather than as unauthorized by this one — the
+    existence of a hidden tool is not something to leak through an authz error.
+
+    The ``@_gated(refuse=...)`` decorators on the six delegation tools are left
+    in place. They are redundant with this middleware over MCP but are NOT dead:
+    they return a structured ``{"success": False, "error": ...}`` envelope that
+    agents handle better than a protocol error, and they keep working for any
+    caller that reaches those functions without passing through FastMCP dispatch.
+    """
+    add_middleware = getattr(server, "add_middleware", None)
+    if not callable(add_middleware):
+        # Fail closed: a FastMCP build that cannot install this gate must not
+        # start ungated and silent. Raising here aborts module import (the
+        # call site below is module-level), the loudest failure available.
+        raise RuntimeError(
+            "FastMCP build has no add_middleware; cannot install the CAO MCP "
+            "tool allowlist gate (#671)"
+        )
+
+    from fastmcp.exceptions import ToolError
+    from fastmcp.server.middleware import Middleware
+
+    class _AllowlistGate(Middleware):
+        async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+            tool_name = context.message.name
+            if tool_name in CALLBACK_EXEMPT_TOOLS:
+                return await call_next(context)
+            denied = await asyncio.to_thread(_tool_denied_reason, tool_name)
+            if denied:
+                raise ToolError(denied)
+            return await call_next(context)
+
+    add_middleware(_AllowlistGate())
 
 
 async def create_ephemeral_agent(
@@ -1865,7 +1944,6 @@ _register_ephemeral_tool(mcp, _ephemeral_enabled_at_startup())
 
 
 @mcp.tool()
-@_gated
 async def memory_store(
     content: str = Field(description="Memory content to store (markdown supported)"),
     scope: str = Field(
@@ -1950,7 +2028,6 @@ async def memory_store(
 
 
 @mcp.tool()
-@_gated
 async def memory_recall(
     query: Optional[str] = Field(
         default=None,
@@ -2069,7 +2146,6 @@ async def memory_recall(
 
 
 @mcp.tool()
-@_gated
 async def memory_forget(
     key: str = Field(description="Key of the memory to remove (e.g. 'prefer-pytest')"),
     scope: str = Field(
@@ -2117,6 +2193,43 @@ async def memory_forget(
         return {"success": False, "error": str(e)}
 
 
+def _partial_write_payload(exc: Exception) -> Optional[Dict[str, Any]]:
+    """Rebuild the typed partial-write payload from an HTTP error body.
+
+    ``MemoryPartialWriteError`` used to be raised in this process, so the tool
+    could read its fields directly. Over HTTP the route answers 500 with
+    ``_memory_partial_write_response``'s shape; a partial write is a repairable
+    on-disk state with a ``repair_command``, so it must keep surfacing as that
+    rather than collapsing into a generic 500 string. Returns ``None`` when the
+    body is not a partial-write report, leaving ordinary translation to run.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(body, dict) or body.get("error_kind") != MemoryPartialWriteError.error_kind:
+        return None
+    partial = body.get("partial_write")
+    if not isinstance(partial, dict):
+        return None
+    return {
+        "success": False,
+        "error_kind": body["error_kind"],
+        "error": str(
+            MemoryPartialWriteError(
+                key=str(partial.get("key")),
+                scope=str(partial.get("scope")),
+                scope_id=partial.get("scope_id"),
+                file_path=str(partial.get("file_path")),
+            )
+        ),
+        "partial_write": partial,
+    }
+
+
 def _outcome_tool_error(
     exc: Exception, fallback: str, *, extra: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -2154,7 +2267,6 @@ def _outcome_tool_error(
 
 
 @mcp.tool()
-@_gated
 async def report_outcome(
     task_label: str = Field(
         description=(
@@ -2226,7 +2338,6 @@ async def report_outcome(
 
 
 @mcp.tool()
-@_gated
 async def list_outcomes(
     session_name: Optional[str] = Field(
         default=None,
@@ -2285,7 +2396,6 @@ async def list_outcomes(
 
 
 @mcp.tool()
-@_gated
 async def store_lesson(
     target_agent_profile: str = Field(
         description=(
@@ -2315,7 +2425,7 @@ async def store_lesson(
     memory type is always 'feedback' (permanent), and the target profile is
     recorded verbatim as the scope id.
 
-    Cross-agent writes are authorized server-side: the CALLER's profile
+    Cross-agent writes are authorized by cao-server: the CALLER's profile
     (resolved from its terminal record, never from tool arguments) must
     declare the ``store_lesson`` capability in its frontmatter. Writing to
     the caller's OWN scope needs no capability — that grants nothing beyond
@@ -2324,86 +2434,59 @@ async def store_lesson(
     Requires memory.learning_enabled=true; returns a disabled payload
     otherwise.
     """
-    from cli_agent_orchestrator.services.memory_service import MemoryService
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+    target = (target_agent_profile or "").strip()
+    if not target:
+        return {"success": False, "error": "target_agent_profile is required"}
+
+    # The terminal ID only; cao-server resolves the record, the caller's
+    # profile and the capability check itself. This tool deliberately does NOT
+    # call _get_terminal_context_from_env() and forward a resolved profile
+    # directly: the caller profile is the authorization input, so letting the
+    # agent process name it outright would make the check self-attested. The
+    # terminal ID that selects the record is still client-chosen (same
+    # CAO_TERMINAL_ID source as every other tool here, and the same shape as
+    # POST /outcomes) — this only stops the capability list itself from being
+    # agent-supplied, it does not bind the caller to an authenticated
+    # principal. Fail closed — without an ID there is no identity to authorize.
+    try:
+        terminal_id = _current_terminal_id()
+    except ValueError as e:
+        return {"success": False, "error": f"Could not resolve terminal context: {e}"}
+    if not terminal_id:
+        return {
+            "success": False,
+            "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
+        }
 
     try:
-        if not is_learning_enabled():
-            return {"success": False, "disabled": True, "error": LEARNING_DISABLED_MESSAGE}
-        target = (target_agent_profile or "").strip()
-        if not target:
-            return {"success": False, "error": "target_agent_profile is required"}
-
-        # Fail closed: a resolved caller identity is REQUIRED. Accepting a
-        # missing context would let a context-free caller write permanent
-        # feedback into any profile's scope.
-        terminal_context = _get_terminal_context_from_env()
-        if not terminal_context:
-            return {
-                "success": False,
-                "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
-            }
-        caller_profile = terminal_context.get("agent_profile")
-
-        # Cross-agent lesson writes are a privileged operation: permanent
-        # feedback memory injected into ANOTHER agent's future sessions.
-        # Authorize via the caller profile's declared capabilities —
-        # resolved server-side from the terminal's registered profile, so a
-        # worker cannot self-grant it through tool arguments.
-        if target != caller_profile:
-            if not _caller_has_store_lesson_capability(caller_profile):
-                return {
-                    "success": False,
-                    "error": (
-                        f"caller profile {caller_profile!r} is not authorized to store "
-                        f"lessons for {target!r}: cross-agent lesson writes require the "
-                        "'store_lesson' capability in the caller's profile frontmatter"
-                    ),
-                }
-
-        # Overriding agent_profile redirects resolve_scope_id's agent-scope
-        # resolution to the target worker. Provenance fields (provider,
-        # terminal_id) still identify the actual caller.
-        lesson_context = {**terminal_context, "agent_profile": target}
-
-        service = MemoryService()
-        memory = await service.store(
-            content=content,
-            scope="agent",
-            memory_type="feedback",
-            key=key,
-            tags=tags or "",
-            terminal_context=lesson_context,
+        payload = mcp_utils.post_body_json(
+            "/lessons",
+            {
+                "target_agent_profile": target,
+                "content": content,
+                "key": key,
+                "tags": tags or "",
+                "source_terminal_id": terminal_id,
+            },
+            timeout=_mcp_timeout(),
         )
         return {
             "success": True,
-            "key": memory.key,
-            "scope": memory.scope,
-            "scope_id": memory.scope_id,
-            "target_agent_profile": target,
+            "key": payload["key"],
+            "scope": payload["scope"],
+            "scope_id": payload["scope_id"],
+            "target_agent_profile": payload["target_agent_profile"],
         }
-    except MemoryPartialWriteError as e:
-        return {
-            "success": False,
-            "error_kind": e.error_kind,
-            "error": str(e),
-            "partial_write": {
-                "key": e.key,
-                "scope": e.scope,
-                "scope_id": e.scope_id,
-                "file_path": e.file_path,
-                "completed_phases": e.completed_phases,
-                "repair_command": e.repair_command,
-            },
-        }
-    except MemoryDisabledError as e:
-        return {"success": False, "disabled": True, "error": str(e)}
+    except requests.RequestException as e:
+        partial = _partial_write_payload(e)
+        if partial is not None:
+            return partial
+        return _outcome_tool_error(e, "Failed to store lesson")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @mcp.tool()
-@_gated
 async def workflow_return(
     output: Annotated[
         Dict[str, Any], Field(description="The structured JSON output for this workflow step")
@@ -2673,7 +2756,6 @@ async def workflow_resume(
 
 
 @mcp.tool()
-@_gated
 async def workflow_cancel(
     run_id: Annotated[str, Field(description="The run id to cancel (from a prior workflow_run)")],
 ) -> Dict[str, Any]:
@@ -2792,7 +2874,6 @@ async def workflow_start(
 
 
 @mcp.tool()
-@_gated
 async def workflow_plan_approval(
     run_id: Annotated[
         str, Field(description="The run id to report on (from workflow_start / workflow_run)")
@@ -2856,7 +2937,6 @@ async def workflow_plan_approval(
 
 
 @mcp.tool()
-@_gated
 async def workflow_status(
     run_id: Annotated[
         str, Field(description="The run id to snapshot (from workflow_start / workflow_run)")
@@ -2892,7 +2972,6 @@ async def workflow_status(
 
 
 @mcp.tool()
-@_gated
 async def workflow_result(
     run_id: Annotated[str, Field(description="The run id whose retained result to fetch")],
 ) -> Dict[str, Any]:
@@ -2938,7 +3017,6 @@ async def workflow_result(
 
 
 @mcp.tool()
-@_gated
 async def workflow_list(
     state: Annotated[
         Optional[str],
@@ -2973,7 +3051,6 @@ async def workflow_list(
 
 
 @mcp.tool()
-@_gated
 async def workflow_wait(
     run_id: Annotated[
         str, Field(description="The run id to follow until it reaches a terminal state")
@@ -3086,7 +3163,6 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
 
 
 @mcp.tool()
-@_gated
 async def workflow_events(
     run_id: Annotated[str, Field(description="The run id whose live event stream to follow")],
     after_seq: Annotated[
@@ -3376,7 +3452,6 @@ def _authoring_success(response: requests.Response) -> Dict[str, Any]:
 
 
 @mcp.tool()
-@_gated
 async def workflow_create(
     name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
     source: Annotated[str, Field(description="The Python spec's full source text")],
@@ -3420,7 +3495,6 @@ async def workflow_create(
 
 
 @mcp.tool()
-@_gated
 async def workflow_update(
     name: Annotated[str, Field(description="Bare workflow name of the EXISTING spec")],
     source: Annotated[str, Field(description="The replacement Python source text")],
@@ -3475,7 +3549,6 @@ async def workflow_update(
 
 
 @mcp.tool()
-@_gated
 async def workflow_get(
     name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
 ) -> Dict[str, Any]:
@@ -3515,7 +3588,6 @@ async def workflow_get(
 
 
 @mcp.tool()
-@_gated
 async def workflow_validate(
     source: Annotated[str, Field(description="Python spec source text to lint, as a draft")],
 ) -> Dict[str, Any]:
@@ -3563,6 +3635,10 @@ async def workflow_validate(
 from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
 
 register_mcp_server_surfaces(mcp)
+
+# Last, so it wraps every tool registered above — CAO's own 33 and anything a
+# plugin's on_mcp_server hook added (#671).
+_install_allowlist_middleware(mcp)
 
 
 def main():

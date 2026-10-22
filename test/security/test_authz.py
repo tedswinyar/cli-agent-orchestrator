@@ -6,7 +6,6 @@ from fastapi import HTTPException
 from cli_agent_orchestrator.security import audit, authz
 from cli_agent_orchestrator.security.authz import (
     ACTIONS,
-    ALWAYS_ALLOWED_TOOLS,
     CALLBACK_TOOLS,
     CAO_MCP_SERVER,
     CAO_OPS_MCP_SERVER,
@@ -80,13 +79,31 @@ class TestOperatorPosture:
 
 
 class TestToolCall:
-    @pytest.mark.parametrize("tool", sorted(ALWAYS_ALLOWED_TOOLS))
-    def test_callback_and_discovery_always_allowed_for_terminal(self, tool):
+    @pytest.mark.parametrize("tool", sorted(CALLBACK_TOOLS))
+    def test_callbacks_always_allowed_for_terminal(self, tool):
         d = authorize(term(allowed=()), TOOL_CALL, tool, server=CAO_MCP_SERVER)
-        assert d.allowed
-        assert d.rule == ("tool:callback" if tool in CALLBACK_TOOLS else "tool:discovery")
+        assert d.allowed and d.rule == "tool:callback"
 
-    @pytest.mark.parametrize("tool", sorted(ALWAYS_ALLOWED_TOOLS))
+    @pytest.mark.parametrize("tool", sorted(DISCOVERY_TOOLS))
+    def test_discovery_pair_passes_on_the_discovery_grant_alone(self, tool):
+        """#972's carve-out: ``discovery`` covers the pair without ``@cao-mcp-server``."""
+        d = authorize(
+            term(allowed=("fs_read", "discovery")), TOOL_CALL, tool, server=CAO_MCP_SERVER
+        )
+        assert d.allowed and d.rule == "tool:discovery"
+
+    @pytest.mark.parametrize("tool", sorted(DISCOVERY_TOOLS))
+    def test_discovery_pair_is_denied_without_the_grant(self, tool):
+        d = authorize(term(allowed=("fs_read",)), TOOL_CALL, tool, server=CAO_MCP_SERVER)
+        assert not d.allowed and d.rule == "tool:default-deny"
+
+    def test_discovery_grant_does_not_widen_to_other_tools(self):
+        d = authorize(
+            term(allowed=("discovery",)), TOOL_CALL, "memory_store", server=CAO_MCP_SERVER
+        )
+        assert not d.allowed and d.rule == "tool:default-deny"
+
+    @pytest.mark.parametrize("tool", sorted(CALLBACK_TOOLS | DISCOVERY_TOOLS))
     def test_exception_set_does_not_leak_to_ops_server(self, tool):
         assert not authorize(
             term(allowed=("*",)), TOOL_CALL, tool, server=CAO_OPS_MCP_SERVER

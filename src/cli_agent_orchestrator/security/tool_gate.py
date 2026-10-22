@@ -15,18 +15,24 @@ Three pieces:
   a ``terminal`` :class:`Principal`.
 * :func:`denial_for` asks :func:`check` and translates the ``Decision`` into
   the string the tool hands back (``None`` = proceed). It owns the warn/enforce
-  split: tools that were already hard-gated on main before the flag existed
-  stay hard-gated, everything else refuses only under ``CAO_PRINCIPAL_ENFORCE``.
-* :func:`gated` builds the decorator each server stacks under ``@mcp.tool``;
-  the AST census in ``test/security/test_tool_gate_census.py`` asserts no
-  registration is missing it.
+  split (:func:`hard`): every denial on ``cao-mcp-server`` is hard, because
+  #972 shipped that whole-surface gate on main as behaviour before the flag
+  existed; ``cao-ops-mcp-server`` tools were not gated on main, so they refuse
+  only under ``CAO_PRINCIPAL_ENFORCE`` and are audited in warn mode.
+* :func:`gated` builds the decorator a server stacks under ``@mcp.tool``. On
+  ``cao-ops-mcp-server`` every registration carries it. On ``cao-mcp-server``
+  the gate is #972's ``_AllowlistGate`` middleware (one decision per dispatch)
+  and the decorator sits only on the six delegation tools whose refusal
+  envelope callers pin; the census in ``test/security/test_tool_gate_census.py``
+  asserts both arrangements.
 
 The decision runs in the MCP process. That is where the tool executes, and for
 the memory tools it is the only place the effect can be stopped at all (they
 touch the filesystem from this process, not through an API route). The
-identity is the terminal record the API serves for ``CAO_TERMINAL_ID``; once
-WS1 injects ``CAO_TERMINAL_TOKEN`` the record fetch presents that credential
-and the API binds the id to the bearer (see :func:`agent_credential`).
+identity is the terminal record the API serves for ``CAO_TERMINAL_ID``; the
+record fetch presents the per-terminal ``CAO_TERMINAL_TOKEN`` through
+:func:`security.agent_credential.agent_credential` (the one credential helper
+for every agent->API hop) and the API binds the id to the bearer.
 
 Nothing here imports ``clients.database``: the MCP boundary stays HTTP-only.
 """
@@ -64,8 +70,10 @@ GATED_ATTR = "__cao_gated_server__"
 
 #: Tools that ``_tool_denied_reason`` already refused on main before
 #: ``CAO_PRINCIPAL_ENFORCE`` existed (#671 via #769, ephemeral via #827). Their
-#: refusals are behaviour today, so they stay hard regardless of the flag; the
-#: flag governs only the tools this gate newly covers. This is an enforcement
+#: refusals are behaviour today, so they stay hard regardless of the flag. Since
+#: #972 the same is true of every tool on ``cao-mcp-server`` (see :func:`hard`),
+#: so this table now only documents the pre-#972 set and keeps the
+#: ``create_ephemeral_agent`` binder's contract explicit. This is an enforcement
 #: mode table, not an authorization rule: the decision itself always comes
 #: from :func:`check`.
 LEGACY_HARD_GATED: frozenset[str] = frozenset(
@@ -97,18 +105,6 @@ def bound_terminal_id() -> Optional[str]:
     return os.environ.get("CAO_TERMINAL_ID") or None
 
 
-def agent_credential() -> Optional[str]:
-    """The per-terminal bearer WS1 injects as ``CAO_TERMINAL_TOKEN``, if present.
-
-    Integration seam: WS1 replaces the shared-bearer helpers with an
-    ``agent_credential()`` that prefers this token. Until that lands the record
-    fetch presents the shared local bearer and the id is self-asserted exactly
-    as it is on main today. Read behind one function so the swap is one edit.
-    """
-
-    return os.environ.get("CAO_TERMINAL_TOKEN") or None
-
-
 def principal_for(context: Mapping[str, Any], allowed: Iterable[str]) -> Principal:
     """Build the ``terminal`` principal for a fetched terminal record.
 
@@ -132,10 +128,16 @@ def principal_for(context: Mapping[str, Any], allowed: Iterable[str]) -> Princip
 # --- the decision, as the tool sees it ------------------------------------------
 
 
-def hard(tool_name: str) -> bool:
-    """Whether a denial of ``tool_name`` refuses the call rather than only auditing it."""
+def hard(tool_name: str, server: Optional[str] = None) -> bool:
+    """Whether a denial of ``tool_name`` on ``server`` refuses the call rather than only auditing it.
 
-    return enforcing() or tool_name in LEGACY_HARD_GATED
+    Hard when enforcing, for every tool on ``cao-mcp-server`` (#972 made the
+    whole-surface allowlist gate behaviour on main, so the flag must not relax
+    it), and for :data:`LEGACY_HARD_GATED` whatever the server. Everything else
+    (today: ``cao-ops-mcp-server``) is warn-mode by default.
+    """
+
+    return enforcing() or server == CAO_MCP_SERVER or tool_name in LEGACY_HARD_GATED
 
 
 def decide(principal: Principal, tool_name: str, *, server: str) -> Decision:
@@ -148,7 +150,7 @@ def decide(principal: Principal, tool_name: str, *, server: str) -> Decision:
     """
 
     try:
-        return check(principal, TOOL_CALL, tool_name, server=server)
+        return check(principal, TOOL_CALL, tool_name, server=server, hard=hard(tool_name, server))
     except HTTPException:
         return authorize(principal, TOOL_CALL, tool_name, server=server)
 
@@ -176,29 +178,29 @@ def denial_for(
     """``None`` to proceed, else the denial the tool returns or raises.
 
     A denied decision proceeds in warn mode (already audited and logged by
-    ``check``) unless the tool is in :data:`LEGACY_HARD_GATED` or
-    ``CAO_PRINCIPAL_ENFORCE`` is on.
+    ``check``) unless :func:`hard` says otherwise: every ``cao-mcp-server``
+    tool, :data:`LEGACY_HARD_GATED`, or ``CAO_PRINCIPAL_ENFORCE`` on.
     """
 
     decision = decide(principal, tool_name, server=server)
     if decision.allowed:
         return None
-    if hard(tool_name):
+    if hard(tool_name, server):
         return denial_text(tool_name, server, decision)
     return None
 
 
-def unresolved(tool_name: str, text: str) -> Optional[str]:
+def unresolved(tool_name: str, text: str, *, server: Optional[str] = None) -> Optional[str]:
     """Fail-closed helper for an identity that could not be resolved.
 
     A bound caller whose record cannot be fetched (or whose allowlist cannot
     be resolved) is an unknown, and an unknown must not dispatch. That is
-    today's behaviour for the legacy tools and enforce-mode behaviour for the
-    rest; in warn mode a newly gated tool proceeds and the failure is logged,
-    so warn mode stays behaviour-preserving.
+    today's behaviour on ``cao-mcp-server`` (#972) and enforce-mode behaviour
+    for ``cao-ops-mcp-server``; in warn mode an ops tool proceeds and the
+    failure is logged, so warn mode stays behaviour-preserving there.
     """
 
-    if hard(tool_name):
+    if hard(tool_name, server):
         return text
     logger.warning("authz warn-mode: would refuse %s: %s", tool_name, text)
     return None
@@ -289,7 +291,6 @@ def is_gated(fn: Any, server: str) -> bool:
 __all__ = [
     "GATED_ATTR",
     "LEGACY_HARD_GATED",
-    "agent_credential",
     "bound_terminal_id",
     "decide",
     "denial_for",
