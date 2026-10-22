@@ -49,7 +49,10 @@ def create_mocks():
 
     Defaults model the happy path on the herdr branch:
     - existing tmux session (session_exists -> True), so new_session=False succeeds
-    - load_agent_profile -> None, which skips allowed-tools resolution and model lookup
+    - load_agent_profile raises FileNotFoundError ("no profile installed"), which skips
+      allowed-tools resolution and model lookup. This is the shape production actually
+      produces: load_agent_profile never returns None, and the launch-time ops admission
+      check inside load_launch_profile dereferences any profile it is handed.
     - provider creates cleanly; shell_baseline is a MagicMock (not str) so it is treated
       as None and update_terminal_shell_command is never called
     - get_herdr_inbox_service -> a live mock service
@@ -78,7 +81,7 @@ def create_mocks():
 
         m.generate_terminal_id.return_value = TERMINAL_ID
         m.generate_window_name.return_value = "developer-base"
-        m.load_agent_profile.return_value = None
+        m.load_agent_profile.side_effect = FileNotFoundError("no profile installed")
 
         backend = m.get_backend.return_value
         backend.session_exists.return_value = True
