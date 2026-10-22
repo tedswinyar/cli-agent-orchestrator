@@ -1568,8 +1568,6 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
 
-CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
-
 #: ``list_siblings``/``update_metadata`` are gated by their own live
 #: ``discovery`` check (``_require_discovery_marker`` above), not by
 #: ``@cao-mcp-server`` -- docs/tool-restrictions.md: "A profile with
