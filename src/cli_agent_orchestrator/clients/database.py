@@ -1638,6 +1638,11 @@ def _migrate_workflow_run() -> None:
 
     PR #849 review additively appends nullable ``kind`` for the run-level terminal
     verdict.  Existing rows keep NULL so cold reads retain the step-derived fallback.
+
+    #965 WS4 additively appends nullable ``owner_terminal_id`` and
+    ``ancestor_terminal_ids`` (a JSON array as TEXT): the run's ownership, stamped from
+    the caller's principal at creation and never updated afterwards. Pre-existing rows
+    read NULL, which the ``run:*`` rules treat as operator-owned.
     """
     import sqlite3
 
@@ -1677,6 +1682,22 @@ def _migrate_workflow_run() -> None:
             if "kind" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
                 logger.info("Migration: added kind column to workflow_run")
+            # Run ownership (#965 WS4, the workflow_cancel ownership issue): the terminal that
+            # started the run and its creator chain, both frozen at creation and read by the
+            # ``run:cancel`` / ``run:resume`` / ``run:replay`` authorize() rules. NULL means
+            # "started by an operator or before this column existed", which the rules treat as
+            # operator-owned (no terminal may claim it). ``ancestor_terminal_ids`` is a JSON
+            # array of terminal ids, never re-derived from the live terminals table.
+            if "owner_terminal_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run ADD COLUMN owner_terminal_id TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added owner_terminal_id column to workflow_run")
+            if "ancestor_terminal_ids" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run ADD COLUMN ancestor_terminal_ids TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added ancestor_terminal_ids column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 

@@ -30,7 +30,18 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 if TYPE_CHECKING:  # avoid a runtime circular import (script_runner imports this module)
     from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
@@ -210,6 +221,12 @@ class RunRecord:
     # constructed here; it binds to the running loop lazily on first await, so
     # building a RunRecord outside a loop (unit tests) is safe.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # #965 WS4, run ownership: the starting principal's terminal and its creator chain,
+    # mirrored into the journal row by ``_journal_insert_run`` and read back by the run
+    # routes when the row is missing (best-effort insert failed). Frozen at creation;
+    # nothing in the engine writes either field after construction.
+    owner_terminal_id: Optional[str] = None
+    ancestor_terminal_ids: Tuple[str, ...] = ()
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -293,6 +310,8 @@ def _journal_insert_run(record: RunRecord) -> None:
             inputs_json=json.dumps(record.inputs),
             state=record.state.value,
             started_at=record.started_at,
+            owner_terminal_id=record.owner_terminal_id,
+            ancestor_terminal_ids=record.ancestor_terminal_ids,
         )
         workflow_journal.insert_steps(
             record.run_id,
@@ -1098,8 +1117,20 @@ def _check_run_id_available(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
-async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def start_run(
+    spec: WorkflowSpec,
+    inputs: Dict[str, Any],
+    run_id: str,
+    *,
+    owner_terminal_id: Optional[str] = None,
+    ancestor_terminal_ids: Sequence[str] = (),
+) -> WorkflowRunResult:
     """Run a validated workflow spec to completion, awaited inline (§1, Q1=A).
+
+    ``owner_terminal_id`` / ``ancestor_terminal_ids`` (#965 WS4) are the starting
+    principal's ``terminal_id`` and ``ancestors``, stamped on the record and the journal
+    row at creation. Keyword-only and defaulted, so every existing caller is unchanged
+    and records an operator-owned run.
 
     Steps: validate the run_id key (B3-BR-1, shared validator) and the inputs
     against ``spec.inputs`` (B3-BR-2) — failing BEFORE any terminal is created;
@@ -1138,6 +1169,8 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         cancelled=False,
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
+        owner_terminal_id=owner_terminal_id,
+        ancestor_terminal_ids=tuple(ancestor_terminal_ids),
     )
     # 4. Register (in-memory floor) + mark the drive live + journal the run +
     # seed every step (§1). The ``finally`` guarantees the liveness mark is
@@ -1319,6 +1352,8 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
             current_step_id=row.current_step_id,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            owner_terminal_id=row.owner_terminal_id,
+            ancestor_terminal_ids=tuple(row.ancestor_terminal_ids),
         )
     except (ValidationError, ValueError, TypeError) as e:
         # ValidationError subclasses ValueError (pydantic v2) but is named for clarity;

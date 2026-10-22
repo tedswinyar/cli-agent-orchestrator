@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `security/audit.py` appends refusals to `CAO_HOME_DIR/logs/authz.jsonl`. Adds a nullable
   `credential_digest` column to `terminals`. Not yet wired into terminal creation. See
   `docs/security/agent-principal.md`.
+- **Experimental:** workflow run ownership (#965 WS4). Runs are stamped with the starting principal's
+  `owner_terminal_id` and frozen `ancestor_terminal_ids` (two nullable columns on `workflow_run`,
+  additive migration) and `POST /workflows/runs/{run_id}/cancel`, `/resume` and
+  `/steps/{step_id}:replay` are authorized through `check(principal, run:*, RunRef)`: owner, frozen
+  ancestor, operator or the run's own principal. Under `CAO_PRINCIPAL_ENFORCE=1` anyone else gets a
+  403 naming the owner's terminal id; in the default warn mode the call proceeds and an audit line is
+  written. A resume from another terminal does not transfer ownership.
 
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes

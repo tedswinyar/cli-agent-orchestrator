@@ -60,6 +60,47 @@ is pure. Unknown actions are refused.
 | `fleet:*`         | ops tool name                              | denied |
 | `operator:route`  | route name                                 | denied |
 
+## Run ownership
+
+A workflow run carries its owner from creation. `POST /workflows/runs` and
+`POST /workflows/runs:submit` stamp two columns on the `workflow_run` row, in the
+same INSERT as the rest of the row, for both the YAML and the script tier:
+
+| column                  | value                                                        |
+|-------------------------|--------------------------------------------------------------|
+| `owner_terminal_id`     | the starting principal's `terminal_id`; NULL for an operator |
+| `ancestor_terminal_ids` | the starting principal's `ancestors` (creator chain, nearest first) as a JSON array; NULL when empty |
+
+Both are **frozen at creation**. They are never recomputed from the live
+`terminals` table and the journal has no UPDATE path for either column, so a
+later re-parent of the terminal tree cannot widen who may act on the run.
+
+`POST .../cancel`, `POST .../resume` and `POST .../steps/{step_id}:replay`
+resolve the caller with `get_current_principal` and call
+`check(principal, RUN_*, RunRef(run_id, owner_terminal_id, ancestor_terminal_ids))`
+before any tier dispatch. Allowed: the owner, any terminal in the frozen
+ancestor list, an operator (CLI or admin bearer; `cao workflow cancel` never
+sees a 403), and a run principal acting on its own `run_id`. Anything else is
+refused with a 403 whose detail names the run, its **owner's** terminal id and
+the caller's terminal id, and nothing else (never prompt text or inputs). A run
+with no owning terminal (operator start, or a row written before this column
+existed) is operator-only.
+
+**A resume is a new caller, not a handoff.** Resuming does not re-stamp the owner
+and does not append the resumer to the ancestor list. A terminal that resumed a
+run in warn mode therefore still cannot cancel it under enforcement; a terminal
+that may resume (owner, ancestor, operator) could already cancel. Ownership
+transfer, if it is ever needed, is a separate explicit and logged call, not a
+side effect of resume.
+
+The structural guard is `test/security/test_run_ownership_guard.py`: it walks
+the AST of `api/main.py` and `mcp_server/server.py`, and fails CI for any
+mutating route that takes a `run_id` and does not call `check()` with a `RUN_*`
+action (two routes are listed as known-ungated with reasons), for any MCP tool
+whose mutating HTTP call reaches a `{run_id}` path that is not one of the gated
+routes, and for any UPDATE statement in the journal that touches an ownership
+column.
+
 ## Warn mode and the enforce flag
 
 `check(principal, action, resource, **ctx)` is what call sites use. It

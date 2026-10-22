@@ -36,7 +36,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
@@ -136,6 +136,10 @@ class ScriptRunRecord:
     finished_at: Optional[str]
     tier: str = "script"
     working_directory: Optional[str] = None
+    # #965 WS4, run ownership: the starting principal's terminal and creator chain, frozen at
+    # creation and mirrored into the journal row by ``run_script_workflow``'s INSERT.
+    owner_terminal_id: Optional[str] = None
+    ancestor_terminal_ids: Tuple[str, ...] = ()
 
 
 def run_root_for(env: Optional[Dict[str, str]]) -> Optional[str]:
@@ -1295,8 +1299,15 @@ async def run_script_workflow(
     run_id: str,
     *,
     working_directory: Optional[str] = None,
+    owner_terminal_id: Optional[str] = None,
+    ancestor_terminal_ids: Sequence[str] = (),
 ) -> WorkflowRunResult:
     """Run a script workflow to completion, awaited inline (A1, S1, US-B1/B4/B5).
+
+    ``owner_terminal_id`` / ``ancestor_terminal_ids`` (#965 WS4) are the starting
+    principal's ``terminal_id`` and ``ancestors``, stamped on the live record and the
+    journal row in the same INSERT as the rest of the row. Defaulted, so existing callers
+    are unchanged and record an operator-owned run.
 
     ``spec`` is the resolved ``ScriptSpec`` (U5/C4) — duck-typed here (U5 owns the
     concrete model): it exposes ``.source`` (script text), ``.path`` (display path
@@ -1365,6 +1376,8 @@ async def run_script_workflow(
         finished_at=None,
         tier="script",
         working_directory=root,
+        owner_terminal_id=owner_terminal_id,
+        ancestor_terminal_ids=tuple(ancestor_terminal_ids),
     )
     # M3 (traceability): a registered record lives for the process lifetime — it is
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
@@ -1398,6 +1411,9 @@ async def run_script_workflow(
             # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 0b and has already gated on
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
+            # #965 WS4: ownership rides the same single INSERT (no unowned window).
+            owner_terminal_id,
+            tuple(ancestor_terminal_ids),
         )
     except (
         Exception

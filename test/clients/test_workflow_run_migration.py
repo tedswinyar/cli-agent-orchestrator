@@ -72,6 +72,8 @@ def test_workflow_run_columns(patched_db):
         "manifest_json",
         "error",
         "kind",
+        "owner_terminal_id",
+        "ancestor_terminal_ids",
     }
     # run_id is the primary key; the nullable columns are current_step_id/finished_at.
     assert cols["run_id"][5] == 1
@@ -103,6 +105,13 @@ def test_workflow_run_columns(patched_db):
     assert cols["kind"][2] == "TEXT"
     assert cols["kind"][3] == 0
     assert cols["kind"][4] == "NULL"
+    # Run ownership (#965 WS4): both nullable TEXT, NULL default, so every pre-WS4 row and
+    # every operator-started run reads as "no owning terminal" (operator-only under the
+    # run:* rules). ``ancestor_terminal_ids`` holds a JSON array; the journal decodes it.
+    for col in ("owner_terminal_id", "ancestor_terminal_ids"):
+        assert cols[col][2] == "TEXT"
+        assert cols[col][3] == 0
+        assert cols[col][4] == "NULL"
 
 
 def test_workflow_run_no_loop_columns(patched_db):
@@ -307,6 +316,9 @@ def test_workflow_run_indexes_do_not_change_columns(patched_db):
         "manifest_json",
         "error",
         "kind",
+        # Run ownership (#965 WS4): same three-mirror rule as manifest_json above.
+        "owner_terminal_id",
+        "ancestor_terminal_ids",
     }
 
 
