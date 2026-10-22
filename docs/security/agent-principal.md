@@ -3,6 +3,10 @@
 **Status:** experimental, warn mode by default. Nothing is refused unless
 `CAO_PRINCIPAL_ENFORCE=1`.
 
+To see it work: `scripts/demo_agent_principal.py` runs the six refusals end to end against an
+isolated server in both modes; [`agent-principal-demo.md`](agent-principal-demo.md) has the
+transcript and what each step proves.
+
 ## What a principal is
 
 Today every CAO surface shares one bearer (or none), and "who is calling" is a

@@ -67,6 +67,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ancestor, operator or the run's own principal. Under `CAO_PRINCIPAL_ENFORCE=1` anyone else gets a
   403 naming the owner's terminal id; in the default warn mode the call proceeds and an audit line is
   written. A resume from another terminal does not transfer ownership.
+- **Experimental:** `scripts/demo_agent_principal.py` (#965 WS6) runs the agent-principal proposal
+  end to end against an isolated `cao-server` with real `mock_cli` panes and real MCP server
+  processes: two terminals with minted credentials, impersonation, the `cao-mcp-server` allowlist
+  gate, a worker callback, run ownership, the operator path and an ops-server tool, once with
+  `CAO_PRINCIPAL_ENFORCE=1` and once in warn mode, printing each request, response and
+  `authz.jsonl` line and exiting non-zero on any unexpected outcome (`--json` for a JSON array).
+  `test/e2e/test_agent_principal_demo.py` pins every outcome. Narrative and transcript in
+  `docs/security/agent-principal-demo.md`.
 
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
