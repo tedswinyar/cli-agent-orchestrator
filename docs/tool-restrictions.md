@@ -252,7 +252,7 @@ CAO therefore gates **every tool on both of its MCP servers** at the boundary ([
   unregistered terminal, an unreadable profile) refuses the call rather than allowing it.
 
 **How it is wired.** On `cao-mcp-server` the gate is one FastMCP `on_call_tool` middleware
-(`_install_allowlist_middleware`, installed after every tool and plugin surface is registered), so a
+(`_install_allowlist_middleware`, installed after every tool and event-plugin surface is registered), so a
 tool added later is covered by default and each dispatch is decided once. The six delegation tools
 (`assign`, `handoff`, `assign_elastic`, `workflow_run`, `workflow_resume`, `workflow_start`)
 additionally carry the gate as a decorator under `@mcp.tool`, because their callers pin a structured
