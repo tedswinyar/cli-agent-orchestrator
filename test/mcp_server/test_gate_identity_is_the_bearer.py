@@ -83,6 +83,12 @@ class _Bridge:
 # --- fixtures -----------------------------------------------------------------
 
 
+#: These tests seed real rows with real credential digests and drive the real
+#: credential helper, so they want production behaviour, not the suite-wide
+#: legacy fallback (``test/conftest.py::legacy_operator_token_fallback``).
+pytestmark = pytest.mark.unpaired_terminal_credential
+
+
 @pytest.fixture(autouse=True)
 def _authz_env(monkeypatch, tmp_path):
     """Default-off auth, warn mode, audit log routed to a per-test home."""
@@ -204,19 +210,47 @@ class TestOwnIdentityStillWorks:
 
 
 class TestUnprovenIdentity:
-    """``CAO_TERMINAL_ID`` set with no terminal credential cannot prove anything."""
+    """``CAO_TERMINAL_ID`` set with no terminal credential cannot prove anything.
 
-    def test_enforce_refuses(self, bridged, tokens, monkeypatch):
-        monkeypatch.setenv("CAO_PRINCIPAL_ENFORCE", "1")
+    This now fails IN THE AGENT'S OWN PROCESS, before a request is made:
+    ``agent_credential`` refuses to present the operator's token for a process
+    that claims an identity it holds no credential for. The gate sees that as
+    any other failure to resolve an identity -- an unknown, which does not
+    dispatch -- and the refusal names the misconfiguration.
+
+    The server-side ``identity:unproven`` rule is still the backstop for a
+    caller that builds the request itself (a shell with the operator's token and
+    a claimed id); that path is tested at the route in
+    ``test/api/test_me_principal.py``.
+    """
+
+    @pytest.mark.parametrize("enforce", ["1", ""], ids=["enforce", "warn"])
+    def test_it_fails_closed_in_both_modes(self, bridged, tokens, monkeypatch, enforce):
+        """Hard regardless of the flag: #972 made the whole cao-mcp-server surface so."""
+        monkeypatch.setenv("CAO_PRINCIPAL_ENFORCE", enforce)
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": TERMINAL_B}):
             denial = server._tool_denied_reason("memory_forget")
         assert denial is not None
-        assert ("identity:unproven", False, True) in _audit_rules()
+        assert "could not be resolved" in denial
 
-    def test_warn_mode_audits_and_preserves_todays_behaviour(self, bridged, tokens):
+    def test_the_refusal_names_the_missing_variable(self, bridged, tokens):
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": TERMINAL_B}):
-            assert server._tool_denied_reason("memory_forget") is None
-        assert ("identity:unproven", False, False) in _audit_rules()
+            denial = server._tool_denied_reason("memory_forget")
+        assert "CAO_TERMINAL_TOKEN" in denial
+        assert TERMINAL_B in denial
+
+    def test_the_operator_token_is_never_put_on_the_wire(self, bridged, tokens, monkeypatch):
+        """The whole point: the header is never built, so no request can carry it.
+
+        ``get_json`` IS entered -- the refusal happens while it assembles the
+        headers -- so the assertion is on the transport, which is where an
+        escalation would actually become one.
+        """
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "operator-secret")
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": TERMINAL_B}):
+            with patch.object(mcp_utils.requests, "get") as transport:
+                assert server._tool_denied_reason("memory_forget") is not None
+        transport.assert_not_called()
 
     def test_a_revoked_credential_fails_closed(self, bridged, tokens, monkeypatch):
         orphan, _ = mint_terminal_credential()  # never written to a row

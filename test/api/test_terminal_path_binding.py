@@ -37,6 +37,10 @@ from cli_agent_orchestrator.security.principal import mint_terminal_credential
 
 #: A created B, B created D; C is unrelated. One chain deep enough to tell
 #: "direct child" from "descendant" apart, which a two-row fixture cannot.
+#: Real rows, real digests, real bearers: production credential behaviour, not
+#: the suite-wide legacy fallback in ``test/conftest.py``.
+pytestmark = pytest.mark.unpaired_terminal_credential
+
 ROOT = "aaaa1111"
 CHILD = "bbbb2222"
 GRANDCHILD = "dddd4444"
@@ -214,7 +218,10 @@ class TestReads:
     def test_an_ancestors_record_is_readable(self, client, tokens, enforce):
         """``_target_binding_denial(allow_parent=True)`` reads it for send_message."""
         assert _get(client, tokens[GRANDCHILD], f"/terminals/{ROOT}").status_code == 200
-        assert ("terminal:ancestor", True, True) not in _audit_rules()  # allows unlogged
+        # Recorded, not silent: an agent's allowed call leaves a line now, and
+        # "a worker read its supervisor's record" is exactly the kind of thing
+        # an operator reviewing a warn-mode release wants to see.
+        assert ("terminal:ancestor", True, True) in _audit_rules()
 
     def test_a_strangers_record_is_refused(self, client, tokens, enforce):
         response = _get(client, tokens[ROOT], f"/terminals/{STRANGER}")
