@@ -4618,7 +4618,52 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
     return metadata
 
 
+def _revoke_terminal_credential(terminal_id: str) -> None:
+    """Clear a terminal's credential digest so its token stops resolving (#965).
+
+    Best-effort by design: an audit or database failure here must not leave a
+    teardown half-done, and for every path that does reach the row delete, row
+    removal is the backstop (a missing row is "revoked" to the resolver). The
+    deferred paths have no such backstop, which is why this runs first and
+    unconditionally.
+    """
+    try:
+        set_terminal_credential_digest(terminal_id, None)
+    except Exception as exc:  # noqa: BLE001 -- row removal is the backstop
+        logger.warning("Could not revoke credential for terminal %s: %s", terminal_id, exc)
+
+
 def dismantle_terminal_runtime(
+    terminal_id: str,
+    metadata: Optional[Dict],
+    kill_window: bool = True,
+) -> bool:
+    """Revoke the terminal's credential (#965), then tear down its runtime state.
+
+    THE teardown chokepoint: ``delete_terminal``, ``session_service.delete_session``
+    and ``herdr_inbox_service``'s runtime reclaim all go through here, so this is
+    where revocation belongs. It used to live in ``delete_terminal`` alone, and
+    the other two paths therefore left a live digest. Row removal is the backstop
+    for the completed cases -- a missing row is "revoked" to the resolver -- but
+    neither of those paths removes the row when cleanup DEFERS, which is exactly
+    the case the digest matters in: the agent is being killed, its token is in a
+    pane environment (and possibly copied elsewhere), and the row survives for a
+    retry. A copied bearer outlived the agent it was issued to.
+
+    Revoked FIRST, before any runtime step: by here the kill is committed, so if
+    a step raises halfway the token must already be dead rather than waiting on a
+    retry that may never come. Best-effort, so a database hiccup cannot leave the
+    runtime half-dismantled; see :func:`_revoke_terminal_credential`.
+
+    The teardown itself is :func:`_dismantle_runtime_state`, whose contract this
+    function returns unchanged.
+    """
+
+    _revoke_terminal_credential(terminal_id)
+    return _dismantle_runtime_state(terminal_id, metadata, kill_window)
+
+
+def _dismantle_runtime_state(
     terminal_id: str,
     metadata: Optional[Dict],
     kill_window: bool = True,
@@ -4853,14 +4898,6 @@ def delete_terminal_row(
     return deleted
 
 
-def _revoke_terminal_credential(terminal_id: str) -> None:
-    """Clear a terminal's credential digest so its token stops resolving (#965)."""
-    try:
-        set_terminal_credential_digest(terminal_id, None)
-    except Exception as exc:  # noqa: BLE001 -- row removal is the backstop
-        logger.warning("Could not revoke credential for terminal %s: %s", terminal_id, exc)
-
-
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -4873,14 +4910,10 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     """
     try:
         metadata = capture_terminal_snapshot(terminal_id)
-        # Revoke the terminal's credential (#965) BEFORE the runtime teardown
-        # runs: from this point the agent is being killed, and whether the kill
-        # is proven now or on a deferred retry its token must stop resolving.
-        # Best-effort: a database hiccup here must not leave the teardown
-        # half-done. Row removal below (and in session teardown, which never
-        # calls this) is the backstop -- a missing row is "revoked" to the
-        # resolver too.
-        _revoke_terminal_credential(terminal_id)
+        # Revocation is inside ``dismantle_terminal_runtime`` -- the chokepoint
+        # every teardown path runs -- rather than here. It used to be here, and
+        # that is precisely why session teardown and the herdr reclaim path left
+        # live digests behind: a per-caller step is a step a caller can omit.
         if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id

@@ -385,6 +385,11 @@ class TestCreateTerminal:
             request_fingerprint=None,
             # Minted per call (#965); the lifecycle tests pin its value.
             credential_digest=ANY,
+            # No creator principal here (in-process call), so no ceiling is
+            # recorded and ``authz.ceiling_of`` falls back to the own allowlist
+            # -- the operator path, unchanged. ``test_delegation_ceiling.py``
+            # covers the agent-creator case.
+            delegate_tools=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 

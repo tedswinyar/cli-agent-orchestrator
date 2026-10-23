@@ -134,7 +134,9 @@ def _who_client() -> TestClient:
             "session_name": p.session_name,
             "agent_profile": p.agent_profile,
             "allowed_tools": list(p.allowed_tools),
-            "delegate_tools": list(p.delegate_tools),
+            # ``None`` (no ceiling recorded) and ``[]`` (may delegate nothing)
+            # are different values to ``authz.ceiling_of``; keep both over the wire.
+            "delegate_tools": None if p.delegate_tools is None else list(p.delegate_tools),
             "creator_id": p.creator_id,
             "ancestors": list(p.ancestors),
         }
@@ -279,8 +281,11 @@ async def test_deferred_teardown_still_revokes_while_the_row_is_retained(
     """An unproven kill keeps the row for a retry; the credential must not outlive the intent."""
     t = await _create(backend, new_session=True)
     token = backend.env_for(t.id)[TERMINAL_TOKEN_ENV]
-    # ``dismantle_terminal_runtime`` reports "could not prove the kill" -> deferred.
-    monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda *a, **k: False)
+    # The runtime BODY reports "could not prove the kill" -> deferred. Stubbing
+    # ``_dismantle_runtime_state`` rather than ``dismantle_terminal_runtime``
+    # matters: the public name is the revoking wrapper now, and a stub over it
+    # would replace the very step under test with nothing.
+    monkeypatch.setattr(terminal_service, "_dismantle_runtime_state", lambda *a, **k: False)
 
     assert delete_terminal(t.id) is False  # deferred
     assert _row(t.id) is not None and _row(t.id).credential_digest is None
@@ -291,7 +296,13 @@ async def test_deferred_teardown_still_revokes_while_the_row_is_retained(
 
 @pytest.mark.asyncio
 async def test_row_removal_alone_revokes(backend, plumbing):
-    """Session teardown never calls ``delete_terminal``; deleting the row is enough."""
+    """Row removal is the backstop on every path: a missing row is "revoked" too.
+
+    Session teardown never calls ``delete_terminal``. It does go through
+    ``dismantle_terminal_runtime``, which revokes (see
+    ``test/security/test_credential_revocation.py``); this pins the backstop
+    that covers a path which somehow reaches neither.
+    """
     from cli_agent_orchestrator.clients.database import delete_terminals_by_session
 
     t = await _create(backend, new_session=True)
