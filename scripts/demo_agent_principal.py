@@ -760,7 +760,7 @@ def step_b2_send_message(server: DemoServer, a: Term, worker_id: str) -> StepRes
         "send_message",
         {"message": "hello from the demo", "receiver_id": worker_id},
     )
-    audit = server.new_audit_lines(expect_some=False)
+    audit = server.new_audit_lines(expect_some=True)
     success = isinstance(payload, dict) and payload.get("success") is True
     # The same question, asked of the pure policy function the gate decides with.
     from cli_agent_orchestrator.security.authz import CAO_MCP_SERVER, TOOL_CALL, authorize
@@ -778,16 +778,39 @@ def step_b2_send_message(server: DemoServer, a: Term, worker_id: str) -> StepRes
         server=CAO_MCP_SERVER,
     )
     text = payload if isinstance(payload, str) else json.dumps(payload, sort_keys=True)
+    # An ALLOWED agent call leaves lines now: with only refusals recorded, a
+    # successful bypass left no trace at all, so warn mode could not reveal the
+    # population it exists to reveal.
+    #
+    # The line is ``terminal:descendant``: the API binding the path id of
+    # ``GET /terminals/{worker}`` -- the read ``_target_binding_denial`` makes
+    # before delivering -- to A's credential. A's own terminal created the
+    # worker, so the read is allowed and attributable.
+    #
+    # There is deliberately NO ``tool:callback`` line, and the absence is worth
+    # seeing rather than papering over. The four callback tools do not reach
+    # ``check()`` at all: #972's ``_AllowlistGate`` SKIPS them before asking
+    # (``CALLBACK_EXEMPT_TOOLS``), so the allowance is a middleware skip, not an
+    # audited decision. ``policy_rule`` below shows what the policy function
+    # WOULD answer if asked. Auditing the skip is a behaviour change to #972's
+    # gate, not part of fixing the audit log, so it is left as an open item.
+    #
+    # Asserting the SET rather than the first line is deliberate: "which line
+    # came first" is not a contract.
+    allowed_rules = sorted({line.get("rule") for line in audit if line.get("allowed")})
+    refused_rules = sorted({line.get("rule") for line in audit if not line.get("allowed")})
     expected = {
         "gate": "allowed",
         "delivered": True,
-        "audit_lines": 0,
+        "audit_allowed_rules": ["terminal:descendant"],
+        "audit_refused_rules": [],
         "policy_rule": "tool:callback",
     }
     observed = {
         "gate": verdict,
         "delivered": success,
-        "audit_lines": len(audit),
+        "audit_allowed_rules": allowed_rules,
+        "audit_refused_rules": refused_rules,
         "policy_rule": policy.rule,
     }
     return StepResult(

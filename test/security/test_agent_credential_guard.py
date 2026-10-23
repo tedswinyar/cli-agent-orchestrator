@@ -31,8 +31,17 @@ import pytest
 SRC = Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator"
 
 # Agent-side modules: everything that runs inside a terminal's process tree.
+#
+# ``ops_mcp_server`` was MISSING here until the agent-principal demo caught the
+# consequence: its ``_auth_headers`` read ``get_local_bearer()`` directly, so
+# when the ops server ran inside a terminal -- the case its own gate exists for
+# -- it presented the operator's token instead of the terminal's. A fourth
+# agent -> API egress outside the one credential helper, in the one package this
+# census did not walk. Enumerating the package is the only thing that stops the
+# fifth.
 SCANNED = [
     *sorted((SRC / "mcp_server").rglob("*.py")),
+    *sorted((SRC / "ops_mcp_server").rglob("*.py")),
     SRC / "utils" / "orchestration.py",
     SRC / "cli" / "commands" / "agent.py",
 ]
@@ -273,3 +282,77 @@ def test_guard_ignores_remote_capable_urls():
         ast.parse('def f(base):\n    requests.get(f"{base}/x", headers={})\n'), "x.py"
     )
     assert (violations, seen) == ([], 0)
+
+
+# --------------------------------------------------------------------------- #
+# The aliases themselves.
+#
+# The census above proves every call site takes its headers from an ACCEPTED
+# name. It said nothing about whether those names are actually aliases over
+# ``agent_credential`` -- and that is precisely how ``ops_mcp_server`` shipped an
+# ``_auth_headers`` that read ``get_local_bearer()`` directly. Every call site
+# was "compliant"; the helper they all went through was the hole. A census of
+# call sites with an unchecked definition is a census of nothing.
+# --------------------------------------------------------------------------- #
+_ALIAS_NAMES = {"_auth_headers", "_auth_headers_for"}
+
+
+def _alias_definitions() -> Dict[str, bool]:
+    """``{"<file>:<line> <name>": calls agent_credential (directly or via a sibling)?}``."""
+    out: Dict[str, bool] = {}
+    for path in SCANNED:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - defensive
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in _ALIAS_NAMES:
+                continue
+            called = {
+                n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+                for n in ast.walk(node)
+                if isinstance(n, ast.Call)
+            }
+            # ``_auth_headers_for`` delegates to the module's own
+            # ``_auth_headers``, which this same test checks independently.
+            covered = bool(called & ({"agent_credential"} | (_ALIAS_NAMES - {node.name})))
+            rel = path.relative_to(SRC.parents[1])
+            out[f"{rel}:{node.lineno} {node.name}"] = covered
+    return out
+
+
+def test_every_accepted_alias_is_really_an_alias():
+    """``_auth_headers`` must delegate, not re-implement."""
+    definitions = _alias_definitions()
+    assert definitions, "no alias definitions found — the walk is broken"
+    hand_rolled = sorted(name for name, ok in definitions.items() if not ok)
+    assert not hand_rolled, (
+        "alias(es) that do not go through agent_credential(): "
+        + ", ".join(hand_rolled)
+        + ". A call-site census cannot help if the helper every site calls "
+        "re-implements credential selection; return agent_credential(...) instead."
+    )
+
+
+def test_the_alias_walk_covers_every_scanned_package():
+    """At least one alias per agent-side package, so a package cannot drop out silently."""
+    packages = {name.split("/")[2] for name in _alias_definitions()}
+    assert {"mcp_server", "ops_mcp_server", "utils"} <= packages, packages
+
+
+def test_the_alias_check_rejects_a_hand_rolled_definition():
+    """The guard can go red for the shape it exists to catch."""
+    tree = ast.parse(
+        "def _auth_headers():\n"
+        "    token = get_local_bearer()\n"
+        '    return {"Authorization": f"Bearer {token}"} if token else None\n'
+    )
+    fn = tree.body[0]
+    called = {
+        n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+    }
+    assert not (called & {"agent_credential"})

@@ -51,10 +51,25 @@ _MEMORY_FORGET_HARD = {
     "audit_rule": "tool:default-deny",
     "audit_enforced": True,
 }
+#: An ALLOWED agent call is audited now (#965): with only refusals recorded, a
+#: successful bypass left no trace at all, so warn mode could not reveal the
+#: population it exists to reveal. Identical in both modes, like step b1.
+#:
+#: The line is ``terminal:descendant``: the API binding the path id of
+#: ``GET /terminals/{worker}`` -- the read ``_target_binding_denial`` makes
+#: before delivering -- to A's credential.
+#:
+#: There is deliberately NO ``tool:callback`` line. The four callback tools do
+#: not reach ``check()``: #972's middleware skips them before asking, so the
+#: allowance is a middleware skip rather than an audited decision.
+#: ``policy_rule`` is what the policy function would answer if asked. Auditing
+#: that skip is a change to #972's gate, so it is an open item, not a silent
+#: expectation here.
 _SEND_MESSAGE_ALLOWED = {
     "gate": "allowed",
     "delivered": True,
-    "audit_lines": 0,
+    "audit_allowed_rules": ["terminal:descendant"],
+    "audit_refused_rules": [],
     "policy_rule": "tool:callback",
 }
 PINNED: Dict[Tuple[str, str], Dict[str, Any]] = {

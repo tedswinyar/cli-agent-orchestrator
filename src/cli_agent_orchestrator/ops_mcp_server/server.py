@@ -15,6 +15,7 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SendMessageResult,
     SessionListResult,
 )
+from cli_agent_orchestrator.security.agent_credential import agent_credential
 from cli_agent_orchestrator.security.auth import (
     get_local_bearer,
     local_auth_misconfig_error,
@@ -81,10 +82,21 @@ def _response_detail(response: requests.Response) -> str:
 def _auth_headers() -> Optional[Dict[str, str]]:
     """Return the ``Authorization`` header for the ops -> API hop, or ``None``.
 
-    Mirrors ``mcp_server/utils.py::_auth_headers``, but returns ``None`` rather
-    than ``{}`` when there is no token: every call site here passes the result
-    straight to ``requests``, and ``headers=None`` is exactly "send no header",
-    which keeps the default-off wire bytes unchanged.
+    Thin alias over :func:`security.agent_credential.agent_credential` (#965,
+    #990), like ``mcp_server/utils.py::_auth_headers``, but returning ``None``
+    rather than ``{}`` when there is no token: every call site here passes the
+    result straight to ``requests``, and ``headers=None`` is exactly "send no
+    header", which keeps the default-off wire bytes unchanged.
+
+    It read ``get_local_bearer()`` DIRECTLY until the agent-principal demo
+    caught it: when this server runs inside a terminal (``CAO_TERMINAL_ID`` set,
+    which is the case the ops gate exists for) it presented the OPERATOR's token
+    instead of the terminal's own, so ``GET /me/principal`` saw an operator
+    bearer, could not bind the claimed id, and answered ``identity:unproven``
+    instead of letting the gate reach ``fleet:operator-only``. A fourth agent ->
+    API egress that did not go through the one credential helper -- exactly
+    #990's class, in a package the bearer call-site census did not walk. It does
+    now (``test/security/test_agent_credential_guard.py``).
 
     Reported by review 5222539218 on #584 (item 7): the packaged ``cao-ops``
     server sent no credential even when the operator had provisioned
@@ -93,8 +105,7 @@ def _auth_headers() -> Optional[Dict[str, str]]:
     token is read from the environment of whatever client launched the server.
     """
 
-    token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else None
+    return agent_credential(operator_bearer=get_local_bearer) or None
 
 
 def _request_json(
