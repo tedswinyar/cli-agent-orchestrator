@@ -210,10 +210,19 @@ class TestHardWhateverTheFlag:
         assert rec["terminal_id"] == TERMINAL_ID
         assert rec["kind"] == "terminal"
 
-    def test_allowed_call_is_not_audited_by_default(self, warn, bound):
+    def test_an_allowed_agent_call_is_audited_as_allowed(self, warn, bound):
+        """An agent's successful call leaves a line, so a bypass is visible.
+
+        Before, only refusals were recorded, so an agent that reached a tool it
+        should not have reached left nothing behind -- the gap all four reviews
+        named.
+        """
         with _with_allowlist(["@cao-mcp-server"]):
             assert server._tool_denied_reason("memory_forget") is None
-        assert audit.read_recent() == []
+        rec = audit.read_recent()[-1]
+        assert rec["kind"] == "terminal"
+        assert rec["allowed"] is True and rec["outcome"] == "allowed"
+        assert rec["rule"] == "tool:allowlist"
 
     def test_hard_table(self, warn):
         assert tool_gate.hard("memory_forget", CAO_MCP_SERVER)

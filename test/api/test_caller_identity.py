@@ -425,7 +425,10 @@ class TestCeilingFromPrincipal:
                 principal=_terminal_principal(),
             )
         unguarded.assert_awaited_once()
-        assert _audit_rules() == []
+        # An AGENT principal's allowed decision IS recorded now (the audit
+        # change in #965: warn mode cannot reveal a bypass if success leaves no
+        # line). An operator's still is not.
+        assert _audit_rules() == [("terminal:within-ceiling", True, True)]
 
     @pytest.mark.asyncio
     async def test_delegate_tools_is_the_ceiling_when_set(self, enforce):

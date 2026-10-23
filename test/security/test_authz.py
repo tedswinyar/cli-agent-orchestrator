@@ -429,7 +429,15 @@ class TestCheck:
         monkeypatch.setenv("CAO_PRINCIPAL_ENFORCE", "1")
         d = check(term(allowed=("*",)), TOOL_CALL, "assign")
         assert d.allowed
-        assert audit.read_recent() == []  # allows not audited unless flagged
+        # An AGENT principal's allowed call IS recorded now: warn mode cannot
+        # reveal a successful bypass if success leaves no line (test_audit.py::
+        # TestAgentAllowsAreLogged). An operator's still is not.
+        assert [(r["kind"], r["outcome"]) for r in audit.read_recent()] == [("terminal", "allowed")]
+
+    def test_an_operator_allow_is_still_unaudited(self, monkeypatch):
+        monkeypatch.setenv("CAO_PRINCIPAL_ENFORCE", "1")
+        assert check(OPERATOR, TOOL_CALL, "assign").allowed
+        assert audit.read_recent() == []
 
     def test_run_resource_repr(self):
         check(term("x"), RUN_CANCEL, RunRef("r1", "o"))

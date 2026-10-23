@@ -115,6 +115,10 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
 )
+
+# #965 WS2 + WS4: the principal dependency and the authorize() entry points used by the
+# identity routes (terminal:act_as, operator:route) and the workflow run routes (run:*).
+from cli_agent_orchestrator.security import audit
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -129,9 +133,6 @@ from cli_agent_orchestrator.security.auth import (
     is_idp_configured,
     require_any_scope,
 )
-
-# #965 WS2 + WS4: the principal dependency and the authorize() entry points used by the
-# identity routes (terminal:act_as, operator:route) and the workflow run routes (run:*).
 from cli_agent_orchestrator.security.authz import (
     IDENTITY_PROVE,
     OPERATOR_ROUTE,
@@ -1740,6 +1741,66 @@ class OriginCheckMiddleware:
                 return
         await self.app(scope, receive, send)
 
+
+class AuthzRequestIdMiddleware:
+    """Tag every authorization decision in one request with one ``request_id`` (#965).
+
+    A single request can produce several audit lines -- ``_effective_caller_id``
+    then ``terminal:create``, or a path binding then a tool call -- and without a
+    correlation id a reader cannot tell which lines belong together, so "one
+    refusal" and "three refusals from one caller" look the same.
+
+    Honours an inbound ``X-Request-Id`` when the client sent one, so a trace that
+    already exists upstream is not broken by inventing a second id, and echoes
+    the id back on the response so a caller can find its own lines. Registered
+    FIRST so it is innermost -- it must wrap the handler, not the Host and Origin
+    guards, whose rejections never reach ``authorize()``.
+    """
+
+    #: Bounded and charset-restricted: the value lands in a log line and in a
+    #: response header, so an unbounded client-supplied string is a log-injection
+    #: and header-splitting vector. A value that fails the check is replaced, not
+    #: rejected: the request is fine, only its label is not.
+    MAX_LEN = 64
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @classmethod
+    def _sanitize(cls, raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        value = raw.strip()
+        if not value or len(value) > cls.MAX_LEN:
+            return None
+        if not all(c.isalnum() or c in "-_." for c in value):
+            return None
+        return value
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        inbound = None
+        for name, value in scope.get("headers", []):
+            if name.decode("latin-1").lower() == "x-request-id":
+                inbound = self._sanitize(value.decode("latin-1"))
+                break
+        with audit.request_scope(inbound) as request_id:
+            header = (b"x-request-id", request_id.encode("latin-1"))
+
+            async def _send(message: Dict[str, Any]) -> None:
+                if message["type"] == "http.response.start":
+                    message = dict(message)
+                    message["headers"] = list(message.get("headers", [])) + [header]
+                await send(message)
+
+            await self.app(scope, receive, _send)
+
+
+# #965: innermost, so the scope is active for every handler and dependency that
+# can call ``check()``. ``add_middleware`` stacks last-added outermost.
+app.add_middleware(AuthzRequestIdMiddleware)
 
 # Security: CSRF / Cross-Origin Request Forgery (CWE-352). See the middleware
 # docstring; the guard must sit INSIDE TrustedHostMiddleware's Host validation
