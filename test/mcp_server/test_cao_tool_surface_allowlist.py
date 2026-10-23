@@ -30,9 +30,11 @@ must stay unrestricted, so a middleware gate cannot reach them.
 
 import asyncio
 import os
+from test.mcp_server.conftest import patch_identity
 from unittest.mock import patch
 
 import pytest
+import requests
 from fastmcp import Client, FastMCP
 
 from cli_agent_orchestrator.mcp_server import server
@@ -54,16 +56,6 @@ UNGATED_BEFORE = (
     "load_skill",
     "workflow_status",
 )
-
-
-def _ctx(allowed_tools, profile_name="worker"):
-    return {
-        "terminal_id": "a1b2c3d4",
-        "session_name": "cao-session",
-        "provider": "codex",
-        "agent_profile": profile_name,
-        "allowed_tools": allowed_tools,
-    }
 
 
 def _server(tool_names):
@@ -99,9 +91,7 @@ class TestUngatedSurfaceNowDenies:
     def test_bound_caller_without_the_grant_is_denied(self, tool):
         mcp = _server([tool])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-            ):
+            with patch_identity(["fs_read"]):
                 with pytest.raises(Exception) as excinfo:
                     _call(mcp, tool)
         assert "@cao-mcp-server" in str(excinfo.value)
@@ -111,18 +101,14 @@ class TestUngatedSurfaceNowDenies:
     def test_the_grant_allows(self, tool):
         mcp = _server([tool])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server,
-                "_get_terminal_context_from_env",
-                return_value=_ctx(["fs_read", "@cao-mcp-server"]),
-            ):
+            with patch_identity(["fs_read", "@cao-mcp-server"]):
                 assert _call(mcp, tool) == {"reached": tool}
 
     @pytest.mark.parametrize("tool", UNGATED_BEFORE)
     def test_unrestricted_allows(self, tool):
         mcp = _server([tool])
         with patch.dict(os.environ, BOUND):
-            with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(["*"])):
+            with patch_identity(["*"]):
                 assert _call(mcp, tool) == {"reached": tool}
 
     def test_a_tool_nobody_thought_to_list_is_gated_by_default(self):
@@ -134,9 +120,7 @@ class TestUngatedSurfaceNowDenies:
         """
         mcp = _server(["some_tool_added_next_quarter"])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-            ):
+            with patch_identity(["fs_read"]):
                 with pytest.raises(Exception) as excinfo:
                     _call(mcp, "some_tool_added_next_quarter")
         assert "@cao-mcp-server" in str(excinfo.value)
@@ -149,9 +133,7 @@ class TestCallbackProtocolStaysReachable:
     def test_exempt_tool_allows_a_caller_without_the_grant(self, tool):
         mcp = _server([tool])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-            ):
+            with patch_identity(["fs_read"]):
                 assert _call(mcp, tool) == {"reached": tool}
 
     def test_send_message_is_exempt(self):
@@ -195,7 +177,7 @@ class TestPolicyIsNotDuplicated:
     def test_unresolvable_bound_caller_fails_closed(self):
         mcp = _server(["memory_store"])
         with patch.dict(os.environ, BOUND):
-            with patch.object(server, "_get_terminal_context_from_env", return_value=None):
+            with patch_identity(side_effect=requests.HTTPError("404 for /me/principal")):
                 with pytest.raises(Exception) as excinfo:
                     _call(mcp, "memory_store")
         assert "could not be resolved" in str(excinfo.value)
@@ -203,11 +185,7 @@ class TestPolicyIsNotDuplicated:
     def test_lookup_failure_fails_closed(self):
         mcp = _server(["memory_store"])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server,
-                "_get_terminal_context_from_env",
-                side_effect=RuntimeError("cao-server unreachable"),
-            ):
+            with patch_identity(side_effect=RuntimeError("cao-server unreachable")):
                 with pytest.raises(Exception) as excinfo:
                     _call(mcp, "memory_store")
         assert "cannot authorize" in str(excinfo.value)
@@ -257,18 +235,14 @@ class TestDiscoveryCarveOut:
     def test_the_discovery_grant_alone_passes_the_gate(self, tool):
         mcp = _server([tool])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["discovery"])
-            ):
+            with patch_identity(["discovery"]):
                 assert _call(mcp, tool) == {"reached": tool}
 
     @pytest.mark.parametrize("tool", sorted(server.DISCOVERY_GATED_TOOLS))
     def test_neither_discovery_nor_cao_mcp_server_is_still_denied(self, tool):
         mcp = _server([tool])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-            ):
+            with patch_identity(["fs_read"]):
                 with pytest.raises(Exception) as excinfo:
                     _call(mcp, tool)
         assert "@cao-mcp-server" in str(excinfo.value)
@@ -277,9 +251,7 @@ class TestDiscoveryCarveOut:
         """``discovery`` grants only the two tools in ``DISCOVERY_GATED_TOOLS``."""
         mcp = _server(["memory_store"])
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", return_value=_ctx(["discovery"])
-            ):
+            with patch_identity(["discovery"]):
                 with pytest.raises(Exception) as excinfo:
                     _call(mcp, "memory_store")
         assert "@cao-mcp-server" in str(excinfo.value)

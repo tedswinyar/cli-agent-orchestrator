@@ -671,6 +671,8 @@ async def test_claim_does_not_enter_step_fingerprint(release_runtime, monkeypatc
 async def test_bound_child_denied_by_real_mcp_gate_before_and_after_release(
     release_runtime, monkeypatch
 ):
+    from test.mcp_server.conftest import identity_body_from_db
+
     from cli_agent_orchestrator.mcp_server import server
     from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -680,9 +682,17 @@ async def test_bound_child_denied_by_real_mcp_gate_before_and_after_release(
     monkeypatch.setattr(
         terminal_service.status_monitor, "get_status", lambda _: TerminalStatus.IDLE
     )
-    monkeypatch.setattr(
-        server.mcp_utils, "get_json", lambda *args, **kwargs: terminal_service.get_terminal(CHILD)
-    )
+
+    # Both of the MCP process's reads, routed at the live tables rather than
+    # faked: ``/me/principal`` is the gate's identity (the production
+    # ``principal_from_terminal_row``, so the ephemeral bit under test comes from
+    # the registry) and ``/terminals/{id}`` is the memory-scope record.
+    def _get_json(path, *args, **kwargs):
+        if path == "/me/principal":
+            return identity_body_from_db(CHILD)
+        return terminal_service.get_terminal(CHILD)
+
+    monkeypatch.setattr(server.mcp_utils, "get_json", _get_json)
     monkeypatch.setattr(server.requests, "get", Mock(return_value=Mock(status_code=404)))
     for released in [False, True]:
         if released:

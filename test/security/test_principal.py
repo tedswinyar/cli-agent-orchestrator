@@ -3,11 +3,13 @@
 import hashlib
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.security import principal as principal_mod
 from cli_agent_orchestrator.security.principal import (
@@ -18,7 +20,9 @@ from cli_agent_orchestrator.security.principal import (
     digest_of,
     get_current_principal,
     mint_terminal_credential,
+    principal_from_payload,
     principal_from_terminal_row,
+    principal_payload,
     require_principal,
 )
 
@@ -53,6 +57,151 @@ class TestPrincipalDataclass:
             p.kind = "operator"  # type: ignore[misc]
 
 
+class TestEffectiveAllowlist:
+    """A recorded ``None`` means "resolve from the agent profile" -- here, once.
+
+    This resolution used to live only in the MCP gate
+    (``utils.caller_tools.caller_effective_allowed_tools``, called by
+    ``_tool_denied_reason``), so the same row was unrestricted on the MCP
+    surface and a bare ``()`` -- deny-all -- to every HTTP route that built a
+    principal from it. One constructor, one answer.
+
+    ``allowlist_resolved`` carries the difference between "the list is empty"
+    and "we could not read the list": the first is a legitimate deny-all an
+    operator can ask for, the second is an unknown, and ``authorize`` refuses
+    it with ``identity:unresolved`` rather than deciding on a list it never saw.
+    """
+
+    def test_recorded_list_is_the_effective_list(self, fresh_db):
+        p = principal_from_terminal_row(_row(fresh_db, "t1", allowed_tools=["fs_read"]))
+        assert p.allowed_tools == ("fs_read",)
+        assert p.allowlist_resolved is True
+
+    def test_recorded_empty_list_is_deny_all_and_resolved(self, fresh_db):
+        """``[]`` round-trips as ``[]``: an explicit deny-all, not an unknown."""
+        p = principal_from_terminal_row(_row(fresh_db, "t1", allowed_tools=[]))
+        assert p.allowed_tools == ()
+        assert p.allowlist_resolved is True
+
+    def test_null_resolves_from_the_profile(self, fresh_db):
+        row = _row(fresh_db, "t1", profile="worker")
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+            return_value=AgentProfile(
+                name="worker", description="t", allowedTools=["@cao-mcp-server"]
+            ),
+        ):
+            p = principal_from_terminal_row(row)
+        assert p.allowed_tools == ("@cao-mcp-server",)
+        assert p.allowlist_resolved is True
+
+    def test_null_resolves_from_the_role_default(self, fresh_db):
+        """ROLE_TOOL_DEFAULTS gives ``developer`` ``@cao-mcp-server``."""
+        row = _row(fresh_db, "t1", profile="worker")
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+            return_value=AgentProfile(name="worker", description="t", role="developer"),
+        ):
+            p = principal_from_terminal_row(row)
+        assert "@cao-mcp-server" in p.allowed_tools
+        assert p.allowlist_resolved is True
+
+    def test_unreadable_profile_is_unresolved(self, fresh_db):
+        row = _row(fresh_db, "t1", profile="worker")
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+            side_effect=FileNotFoundError("no such profile"),
+        ):
+            p = principal_from_terminal_row(row)
+        assert p.allowed_tools == ()
+        assert p.allowlist_resolved is False
+
+    def test_null_with_no_profile_is_unresolved(self, fresh_db):
+        p = principal_from_terminal_row(_row(fresh_db, "t1", profile=None))
+        assert p.allowed_tools == ()
+        assert p.allowlist_resolved is False
+
+    def test_an_unresolved_allowlist_is_refused_not_treated_as_deny_all(self, fresh_db):
+        """The reason the flag exists, stated as policy rather than data."""
+        from cli_agent_orchestrator.security.authz import TOOL_CALL, authorize
+
+        p = principal_from_terminal_row(_row(fresh_db, "t1", profile=None))
+        decision = authorize(p, TOOL_CALL, "send_message")
+        assert not decision.allowed
+        assert decision.rule == "identity:unresolved"
+
+
+class TestSerialization:
+    """``principal_payload`` / ``principal_from_payload`` are the API -> MCP wire.
+
+    The MCP boundary never touches ``clients.database``, so the only way it can
+    have the same principal an HTTP route has is to be handed one. A round-trip
+    that loses a field is the ``delegate_tools``-missing-on-MCP defect in a new
+    costume, so the test enumerates the dataclass rather than a hand-written
+    list of fields to check.
+    """
+
+    @staticmethod
+    def _full() -> Principal:
+        return Principal(
+            kind="terminal",
+            scopes=frozenset({auth.SCOPE_READ, auth.SCOPE_WRITE}),
+            terminal_id="t1",
+            session_name="cao-sess",
+            agent_profile="developer",
+            role="developer",
+            allowed_tools=("fs_read", "@cao-mcp-server"),
+            delegate_tools=("fs_read",),
+            creator_id="c1",
+            ancestors=("c1", "root"),
+            run_id=None,
+            ephemeral=True,
+            allowlist_resolved=False,
+        )
+
+    def test_round_trip_is_identity(self):
+        original = self._full()
+        assert principal_from_payload(principal_payload(original)) == original
+
+    def test_every_dataclass_field_is_on_the_wire_or_derived(self):
+        """A field added to ``Principal`` must be serialized or named as derived."""
+        import dataclasses
+
+        from cli_agent_orchestrator.security.principal import _PAYLOAD_FIELDS
+
+        derived = {"scopes"}
+        declared = {f.name for f in dataclasses.fields(Principal)}
+        assert declared == set(_PAYLOAD_FIELDS) | derived, (
+            "Principal gained or lost a field: add it to _PAYLOAD_FIELDS (so the MCP "
+            "boundary sees it) or to this test's `derived` set with a reason."
+        )
+
+    def test_payload_is_plain_json(self):
+        import json
+
+        payload = principal_payload(self._full())
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_scopes_are_not_read_from_the_wire(self):
+        """A caller must not be able to name its own scope set."""
+        payload = principal_payload(self._full())
+        payload["scopes"] = ["cao:admin"]
+        assert principal_from_payload(payload).scopes == frozenset(
+            {auth.SCOPE_READ, auth.SCOPE_WRITE}
+        )
+
+    @pytest.mark.parametrize("kind", ["operator", "anonymous"])
+    def test_an_unbounded_kind_gets_the_full_scope_set(self, kind):
+        rebuilt = principal_from_payload({"kind": kind})
+        assert rebuilt.scopes == frozenset(auth.FULL_SCOPE_SET)
+        assert rebuilt.is_operator
+
+    @pytest.mark.parametrize("kind", ["", None, "admin", "Terminal"])
+    def test_an_unknown_kind_is_refused(self, kind):
+        with pytest.raises(ValueError, match="unknown principal kind"):
+            principal_from_payload({"kind": kind})
+
+
 class TestFromTerminalRow:
     def test_fields_copied_from_row(self, fresh_db):
         row = _row(fresh_db, "t1", allowed_tools=["fs_read", "@cao-mcp-server"])
@@ -68,11 +217,7 @@ class TestFromTerminalRow:
         assert p.scopes == frozenset({auth.SCOPE_READ, auth.SCOPE_WRITE})
         assert auth.SCOPE_ADMIN not in p.scopes
 
-    def test_null_allowed_tools_is_empty_tuple(self, fresh_db):
-        p = principal_from_terminal_row(_row(fresh_db, "t1"))
-        assert p.allowed_tools == ()
-
-    def test_delegate_tools_read_when_row_has_it(self):
+    def test_delegate_tools_read_when_row_has_it(self, fresh_db):
         row = types.SimpleNamespace(
             id="x",
             caller_id=None,
@@ -81,7 +226,6 @@ class TestFromTerminalRow:
             allowed_tools='["*"]',
             delegate_tools='["fs_read"]',
         )
-        # No DB needed: no caller to follow.
         p = principal_from_terminal_row(row)
         assert p.delegate_tools == ("fs_read",)
         assert p.allowed_tools == ("*",)

@@ -10,9 +10,13 @@ policy stays in :mod:`security.authz`.
 
 Three pieces:
 
-* :func:`principal_for` turns the terminal record a server fetched over HTTP
-  (plus the effective allowlist resolved the way ``create_terminal`` does) into
-  a ``terminal`` :class:`Principal`.
+* :func:`principal_for` DESERIALIZES the principal the API resolved from the
+  bearer at ``GET /me/principal``. It does not construct one: this module used
+  to build a second ``Principal`` out of a fetched terminal record, which both
+  trusted a forgeable ``CAO_TERMINAL_ID`` and silently dropped
+  ``delegate_tools``, so the delegation ceiling differed by surface. The row ->
+  principal constructor lives in exactly one place
+  (``security.principal.principal_from_terminal_row``).
 * :func:`denial_for` asks :func:`check` and translates the ``Decision`` into
   the string the tool hands back (``None`` = proceed). It owns the warn/enforce
   split (:func:`hard`): every denial on ``cao-mcp-server`` is hard, because
@@ -29,10 +33,12 @@ Three pieces:
 The decision runs in the MCP process. That is where the tool executes, and for
 the memory tools it is the only place the effect can be stopped at all (they
 touch the filesystem from this process, not through an API route). The
-identity is the terminal record the API serves for ``CAO_TERMINAL_ID``; the
-record fetch presents the per-terminal ``CAO_TERMINAL_TOKEN`` through
+identity is whatever ``GET /me/principal`` says the BEARER is: the fetch
+presents the per-terminal ``CAO_TERMINAL_TOKEN`` through
 :func:`security.agent_credential.agent_credential` (the one credential helper
-for every agent->API hop) and the API binds the id to the bearer.
+for every agent->API hop), passes the ``CAO_TERMINAL_ID`` this process claims
+as ``claimed_terminal_id``, and the API refuses (enforce) or audits (warn) a
+claim the bearer does not prove.
 
 Nothing here imports ``clients.database``: the MCP boundary stays HTTP-only.
 """
@@ -44,7 +50,7 @@ import functools
 import inspect
 import logging
 import os
-from typing import Any, Callable, Iterable, Mapping, Optional, TypeVar
+from typing import Any, Callable, Mapping, Optional, TypeVar
 
 from fastapi import HTTPException
 from fastmcp.exceptions import ToolError
@@ -52,13 +58,15 @@ from fastmcp.exceptions import ToolError
 from cli_agent_orchestrator.security.authz import (
     CAO_MCP_SERVER,
     CAO_OPS_MCP_SERVER,
+    EPHEMERAL_DELEGATE,
+    EPHEMERAL_DEPTH,
     TOOL_CALL,
     Decision,
     authorize,
     check,
     enforcing,
 )
-from cli_agent_orchestrator.security.principal import AGENT_SCOPES, Principal
+from cli_agent_orchestrator.security.principal import Principal, principal_from_payload
 
 logger = logging.getLogger(__name__)
 
@@ -105,24 +113,108 @@ def bound_terminal_id() -> Optional[str]:
     return os.environ.get("CAO_TERMINAL_ID") or None
 
 
-def principal_for(context: Mapping[str, Any], allowed: Iterable[str]) -> Principal:
-    """Build the ``terminal`` principal for a fetched terminal record.
+#: Name of the identity rule in a ``GET /me/principal`` body when the bearer
+#: did not prove the claimed ``CAO_TERMINAL_ID``. The API has already audited
+#: it; the gate only needs to know whether to log the warn-mode line.
+_BOUND_KEY = "identity_bound"
 
-    ``allowed`` is the EFFECTIVE allowlist: the recorded ``allowed_tools`` or
-    the profile resolution ``None`` stands for, exactly as
-    ``utils.caller_tools.caller_effective_allowed_tools`` computes it. The
-    record alone is not enough because a recorded ``None`` means "resolve from
-    the profile", not "nothing".
+
+def principal_for(payload: Mapping[str, Any]) -> Principal:
+    """The principal from a ``GET /me/principal`` response body.
+
+    ``payload`` is the whole body (``{"principal": ..., "identity_bound": ...,
+    ...}``). The principal itself is deserialized by
+    :func:`security.principal.principal_from_payload`, the inverse of the one
+    constructor, so the allowlist, the delegation ceiling, the creator, the
+    ancestry and the ephemeral bit are exactly what an HTTP route would see for
+    the same caller.
+
+    A body whose ``identity_bound`` is false is warn mode reporting that the
+    API fell back to the claimed terminal; the refusal is already in the audit
+    log, so this only restates it in the MCP process's own log.
     """
 
-    return Principal(
-        kind="terminal",
-        scopes=AGENT_SCOPES,
-        terminal_id=str(context.get("terminal_id") or ""),
-        session_name=context.get("session_name"),
-        agent_profile=context.get("agent_profile"),
-        allowed_tools=tuple(str(a) for a in allowed),
+    inner = payload.get("principal")
+    if not isinstance(inner, Mapping):
+        raise ValueError("principal payload has no 'principal' object")
+    if not payload.get(_BOUND_KEY, True):
+        logger.warning(
+            "authz warn-mode: identity not bound to the bearer (%s); "
+            "authorizing as the claimed terminal %s",
+            payload.get("rule"),
+            payload.get("claimed_terminal_id"),
+        )
+    return principal_from_payload(inner)
+
+
+# --- ephemeral launch policy -----------------------------------------------------
+
+#: The six tools that start work under a caller-chosen profile, i.e. the ones
+#: ``ephemeral.child_may_delegate`` governs. Same six that carry ``@_gated``.
+_DELEGATION_TOOLS: frozenset[str] = LEGACY_HARD_GATED - {"create_ephemeral_agent"}
+
+
+def ephemeral_denial(principal: Principal, tool_name: str) -> Optional[str]:
+    """``None``, or the ephemeral-policy refusal for ``tool_name``.
+
+    ``ephemeral.max_depth=1`` and ``ephemeral.child_may_delegate`` are not
+    allowlist rules, so they are decided before the allowlist and keep their own
+    message text, which callers and the ephemeral tests pin. What changed is
+    that they go through :func:`security.authz.check` under
+    ``ephemeral:max-depth`` / ``ephemeral:child-delegation`` instead of
+    returning a bare string: these were the two refusals ``authorize()`` never
+    saw, so an ephemeral agent denied here left nothing in the audit log while
+    every other denial on the same surface left a line.
+
+    ``hard=True`` because both refusals were behaviour before
+    ``CAO_PRINCIPAL_ENFORCE`` existed; the flag must not relax them.
+    """
+
+    if tool_name == "create_ephemeral_agent":
+        decision = _check_hard(principal, EPHEMERAL_DEPTH, tool_name)
+        if not decision.allowed:
+            return (
+                "max_depth_exceeded: ephemeral agents cannot create ephemeral agents "
+                "(ephemeral.max_depth=1)"
+            )
+        return None
+
+    if tool_name not in _DELEGATION_TOOLS:
+        return None
+
+    try:
+        from cli_agent_orchestrator.services.settings_service import child_may_delegate
+
+        may_delegate = child_may_delegate()
+    except Exception as exc:  # noqa: BLE001  (an unknown policy must not dispatch)
+        return (
+            f"cannot authorize '{tool_name}': ephemeral delegation policy could not "
+            f"be resolved ({exc})"
+        )
+
+    decision = _check_hard(
+        principal, EPHEMERAL_DELEGATE, tool_name, child_may_delegate=may_delegate
     )
+    if not decision.allowed:
+        return (
+            f"'{tool_name}' is not permitted: ephemeral child delegation requires "
+            "ephemeral.child_may_delegate"
+        )
+    return None
+
+
+def _check_hard(principal: Principal, action: str, resource: Any, **ctx: Any) -> Decision:
+    """``check(..., hard=True)``, recovering the decision from the 403 it raises.
+
+    Same recovery as :func:`decide`: ``check`` signals an enforced refusal by
+    raising ``HTTPException``, which the MCP boundary cannot propagate to an
+    agent, and ``authorize`` is pure so re-running it yields the same answer.
+    """
+
+    try:
+        return check(principal, action, resource, hard=True, **ctx)
+    except HTTPException:
+        return authorize(principal, action, resource, **ctx)
 
 
 # --- the decision, as the tool sees it ------------------------------------------
@@ -295,6 +387,7 @@ __all__ = [
     "decide",
     "denial_for",
     "denial_text",
+    "ephemeral_denial",
     "gated",
     "hard",
     "is_gated",

@@ -2,6 +2,7 @@
 
 import json
 import logging
+from test.mcp_server.conftest import patch_identity
 from test.services.test_ephemeral_service import CALLER, SPEC, create_store  # noqa: F401
 from unittest.mock import Mock
 
@@ -92,29 +93,19 @@ def test_ephemeral_creator_always_refused(create_store, monkeypatch, state, may_
     response = client().post("/ephemeral-agents", params={"caller_id": CALLER}, json=SPEC)
     assert response.status_code == 400 and response.json()["detail"]["rule"] == "max_depth_exceeded"
     monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
-    monkeypatch.setattr(
-        server.mcp_utils,
-        "get_json",
-        lambda *a, **k: {
-            "id": CALLER,
-            "session_name": "cao-session",
-            "provider": "claude_code",
-            "ephemeral": True,
-            "allowed_tools": ["@cao-mcp-server"],
-        },
-    )
     monkeypatch.setattr(server.requests, "get", Mock(return_value=Mock(status_code=404)))
-    assert "max_depth_exceeded" in server._tool_denied_reason("create_ephemeral_agent")
-    if may_delegate:
-        for tool in (
-            "handoff",
-            "assign",
-            "workflow_resume",
-            "workflow_start",
-            "assign_elastic",
-            "workflow_run",
-        ):
-            assert server._tool_denied_reason(tool) is None
+    with patch_identity(["@cao-mcp-server"], terminal_id=CALLER, ephemeral=True):
+        assert "max_depth_exceeded" in server._tool_denied_reason("create_ephemeral_agent")
+        if may_delegate:
+            for tool in (
+                "handoff",
+                "assign",
+                "workflow_resume",
+                "workflow_start",
+                "assign_elastic",
+                "workflow_run",
+            ):
+                assert server._tool_denied_reason(tool) is None
 
 
 @pytest.mark.parametrize("value", [False, "true", None, True])

@@ -5,6 +5,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from test.mcp_server.conftest import patch_identity
 from test.services.test_ephemeral_bind import (  # noqa: F401
     CHILD,
     assert_released,
@@ -172,14 +173,10 @@ async def test_model_override_refuses_before_claim(launch_http, path):
 @pytest.mark.parametrize("tool", ["assign", "handoff"])
 async def test_r2_precedes_claim(launch_http, monkeypatch, tool):
     runtime, _, calls, _, _ = launch_http
-    monkeypatch.setattr(
-        server,
-        "_get_terminal_context_from_env",
-        lambda: {"terminal_id": CALLER, "ephemeral": True, "allowed_tools": ["@cao-mcp-server"]},
-    )
-    result = await getattr(server, tool)(
-        runtime[1], "inspect", engine=None, model=None, use_worktree=False, target_host=None
-    )
+    with patch_identity(["@cao-mcp-server"], terminal_id=CALLER, ephemeral=True):
+        result = await getattr(server, tool)(
+            runtime[1], "inspect", engine=None, model=None, use_worktree=False, target_host=None
+        )
     data = result if isinstance(result, dict) else result.model_dump()
     assert not data["success"]
     assert "ephemeral" in str(data)

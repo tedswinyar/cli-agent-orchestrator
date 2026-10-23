@@ -7,6 +7,11 @@ as ``cao-mcp-server`` does, so a human driving the ops server from outside a
 session (the supported use) is never looked up and the default-off wire bytes
 are unchanged. These tools were not gated on main, so a denial refuses only
 under ``CAO_PRINCIPAL_ENFORCE``; warn mode audits and proceeds.
+
+The identity is the BEARER's principal from ``GET /me/principal``, not the row
+``CAO_TERMINAL_ID`` names: this gate reached that row through the same
+``GET /terminals/{id}`` hop that made the substitution possible on the CAO
+server, so it is bound the same way.
 """
 
 from __future__ import annotations
@@ -24,13 +29,13 @@ from cli_agent_orchestrator.security import audit, tool_gate
 from cli_agent_orchestrator.security.authz import CAO_OPS_MCP_SERVER
 
 TERMINAL_ID = "a1b2c3d4"
-RECORD = {
-    "id": TERMINAL_ID,
-    "session_name": "cao-session",
-    "provider": "codex",
-    "agent_profile": "worker",
-    "allowed_tools": ["*"],
-}
+
+
+def _body(**kwargs):
+    """A ``GET /me/principal`` body, via the shared builder the CAO gate's tests use."""
+    from test.mcp_server.conftest import identity_body
+
+    return identity_body(["*"], terminal_id=TERMINAL_ID, **kwargs)
 
 
 @pytest.fixture
@@ -52,7 +57,7 @@ def enforce(home, monkeypatch):
 @pytest.fixture
 def terminal(monkeypatch):
     monkeypatch.setenv("CAO_TERMINAL_ID", TERMINAL_ID)
-    with patch.object(gate, "_fetch_terminal_record", return_value=dict(RECORD)):
+    with patch.object(gate, "_fetch_caller_principal", return_value=_body()):
         yield
 
 
@@ -64,7 +69,7 @@ def operator(monkeypatch):
 class TestOperator:
     @pytest.mark.parametrize("tool", sorted(EXPECTED_OPS_TOOLS))
     def test_allowed_without_a_lookup(self, enforce, operator, tool):
-        with patch.object(gate, "_fetch_terminal_record") as fetch:
+        with patch.object(gate, "_fetch_caller_principal") as fetch:
             assert gate._tool_denied_reason(tool) is None
         fetch.assert_not_called()
         assert audit.read_recent() == []
@@ -106,25 +111,33 @@ class TestTerminalPrincipal:
             result = await ops.list_profiles()
         assert result.success is True
 
-    def test_unresolvable_record_fails_closed_when_enforcing(self, enforce, monkeypatch):
+    def test_unresolvable_identity_fails_closed_when_enforcing(self, enforce, monkeypatch):
         monkeypatch.setenv("CAO_TERMINAL_ID", TERMINAL_ID)
-        with patch.object(gate, "_fetch_terminal_record", side_effect=RuntimeError("down")):
+        with patch.object(gate, "_fetch_caller_principal", side_effect=RuntimeError("down")):
             reason = gate._tool_denied_reason("shutdown_session")
         assert reason is not None and "cannot authorize" in reason
 
-    def test_unresolvable_record_proceeds_in_warn_mode(self, warn, monkeypatch):
+    def test_unresolvable_identity_proceeds_in_warn_mode(self, warn, monkeypatch):
         monkeypatch.setenv("CAO_TERMINAL_ID", TERMINAL_ID)
-        with patch.object(gate, "_fetch_terminal_record", side_effect=RuntimeError("down")):
+        with patch.object(gate, "_fetch_caller_principal", side_effect=RuntimeError("down")):
             assert gate._tool_denied_reason("shutdown_session") is None
 
-    def test_record_fetch_uses_the_servers_request_helper(self, monkeypatch):
-        with patch.object(ops, "_request_json", return_value=(dict(RECORD), None)) as request:
-            record = gate._fetch_terminal_record(TERMINAL_ID)
-        assert record == RECORD
-        assert request.call_args.args == ("get", f"/terminals/{TERMINAL_ID}")
+    def test_a_rejected_payload_fails_closed_when_enforcing(self, enforce, monkeypatch):
+        """A body the deserializer cannot read is an unknown, not an operator."""
+        monkeypatch.setenv("CAO_TERMINAL_ID", TERMINAL_ID)
+        with patch.object(gate, "_fetch_caller_principal", return_value={"identity_bound": True}):
+            reason = gate._tool_denied_reason("shutdown_session")
+        assert reason is not None and "cannot authorize" in reason
+
+    def test_the_fetch_uses_the_servers_request_helper_and_sends_the_claim(self, monkeypatch):
+        body = _body()
+        with patch.object(ops, "_request_json", return_value=(body, None)) as request:
+            assert gate._fetch_caller_principal(TERMINAL_ID) == body
+        assert request.call_args.args == ("get", "/me/principal")
+        assert request.call_args.kwargs["params"] == {"claimed_terminal_id": TERMINAL_ID}
         with patch.object(ops, "_request_json", return_value=(None, "boom")):
             with pytest.raises(RuntimeError):
-                gate._fetch_terminal_record(TERMINAL_ID)
+                gate._fetch_caller_principal(TERMINAL_ID)
 
 
 class TestDecisionTools:

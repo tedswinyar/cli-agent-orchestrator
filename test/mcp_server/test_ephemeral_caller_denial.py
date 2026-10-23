@@ -3,10 +3,12 @@
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from test.mcp_server.conftest import identity_body_from_db
 from test.utils.test_agent_profiles_ephemeral import DOCUMENT, NAME, stores  # noqa: F401
 from unittest.mock import Mock
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -44,9 +46,17 @@ def registry(monkeypatch):
     )
     monkeypatch.setattr(terminal_service, "get_deferred_init_failure", lambda *_: None)
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    monkeypatch.setattr(
-        server.mcp_utils, "get_json", lambda *_, **__: terminal_service.get_terminal("abcd1234")
-    )
+
+    # The MCP process's two HTTP reads, routed at the live tables rather than
+    # faked: ``/me/principal`` is the gate's identity (built by the production
+    # ``principal_from_terminal_row``, so the ephemeral bit under test comes
+    # from the registry) and ``/terminals/{id}`` is the memory-scope record.
+    def _get_json(path, *_, **__):
+        if path == "/me/principal":
+            return identity_body_from_db("abcd1234")
+        return terminal_service.get_terminal("abcd1234")
+
+    monkeypatch.setattr(server.mcp_utils, "get_json", _get_json)
     monkeypatch.setattr(server.requests, "get", Mock(return_value=Mock(status_code=404)))
     monkeypatch.setattr(
         settings_service,
@@ -356,10 +366,39 @@ async def test_workflows_refuse_unresolved_callers(registry, monkeypatch, tool, 
     post.assert_not_called()
 
 
-@pytest.mark.parametrize("tool", TOOLS)
-def test_old_server_without_marker_keeps_installed_caller_compatible(registry, monkeypatch, tool):
+def test_an_old_server_record_without_the_marker_still_reads_as_not_ephemeral(
+    registry, monkeypatch
+):
+    """The memory-scope record stays tolerant of a pre-marker server.
+
+    ``_get_terminal_context_from_env`` feeds memory scoping, which degrades
+    rather than refuses, so a server too old to publish ``ephemeral`` is
+    treated as not ephemeral there, unchanged.
+    """
     metadata = terminal_service.get_terminal("abcd1234")
     metadata.pop("ephemeral")
     monkeypatch.setattr(server.mcp_utils, "get_json", lambda *a, **k: metadata)
     assert server._get_terminal_context_from_env()["ephemeral"] is False
-    assert server._tool_denied_reason(tool) is None
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_a_server_too_old_to_serve_me_principal_fails_closed(registry, monkeypatch, tool):
+    """BEHAVIOUR CHANGE, recorded on purpose.
+
+    The gate's subject is no longer the terminal record this process asked for
+    but the principal the server resolves from the BEARER, served at
+    ``GET /me/principal``. A cao-server old enough to lack that route cannot
+    answer "who is calling", and an identity nobody can state is an unknown --
+    which does not dispatch. Before, such a server's record was accepted and
+    the claimed ``CAO_TERMINAL_ID`` decided the allowlist, which is the
+    substitution this branch exists to close; "compatible with an old server"
+    and "authorizes a forgeable id" were the same property.
+    """
+    monkeypatch.setattr(
+        server.mcp_utils,
+        "get_json",
+        Mock(side_effect=requests.HTTPError("404 Not Found for /me/principal")),
+    )
+    denial = server._tool_denied_reason(tool)
+    assert denial is not None
+    assert "could not be resolved" in denial

@@ -133,6 +133,7 @@ from cli_agent_orchestrator.security.auth import (
 # #965 WS2 + WS4: the principal dependency and the authorize() entry points used by the
 # identity routes (terminal:act_as, operator:route) and the workflow run routes (run:*).
 from cli_agent_orchestrator.security.authz import (
+    IDENTITY_PROVE,
     OPERATOR_ROUTE,
     RUN_CANCEL,
     RUN_REPLAY,
@@ -140,8 +141,13 @@ from cli_agent_orchestrator.security.authz import (
     TERMINAL_ACT_AS,
     RunRef,
     check,
+    enforcing,
 )
-from cli_agent_orchestrator.security.principal import Principal, get_current_principal
+from cli_agent_orchestrator.security.principal import (
+    Principal,
+    get_current_principal,
+    principal_payload,
+)
 from cli_agent_orchestrator.services import (
     approval_gate,
     approval_provenance,
@@ -2560,6 +2566,67 @@ def _effective_caller_id(principal: Principal, claimed: Optional[str]) -> Option
     if claimed is not None:
         check(principal, TERMINAL_ACT_AS, claimed)
     return principal.terminal_id
+
+
+@app.get("/me/principal")
+async def get_my_principal(
+    claimed_terminal_id: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    principal: Principal = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    """The caller's OWN principal, resolved from the bearer (#965).
+
+    The route the MCP boundary asks "who am I" instead of fetching the row its
+    ``CAO_TERMINAL_ID`` names. That substitution was the branch's central
+    defect: ``GET /terminals/{id}`` admits any read-scoped bearer and never
+    bound the path id to it, so a process holding terminal A's credential and
+    exporting ``CAO_TERMINAL_ID=B`` was authorized with B's allowlist.
+
+    ``claimed_terminal_id`` is the identity the calling process asserts. The
+    binding decision is made HERE, through ``check(IDENTITY_PROVE)``, so there
+    is one decision point and one audit line for it:
+
+    * no claim, or a claim equal to the bearer's own terminal: the bearer's
+      principal, ``identity_bound: true``;
+    * a claim naming a DIFFERENT terminal than the bearer's
+      (``terminal:impersonation``), or a claim from a bearer that resolves to
+      no terminal at all (``identity:unproven`` -- the credential-fallback
+      case): 403 under ``CAO_PRINCIPAL_ENFORCE``. In warn mode the refusal is
+      audited and the response carries the CLAIMED terminal's principal with
+      ``identity_bound: false``, which is byte-for-byte what every surface did
+      before this route existed. Warn mode preserving a hole it now records is
+      the whole point of warn mode; what it must not do is keep the hole
+      invisible.
+
+    The body's ``principal`` is :func:`security.principal.principal_payload` of
+    a :func:`security.principal.principal_from_terminal_row` result -- the one
+    construction path -- so the ceiling the MCP gate computes and the ceiling
+    an HTTP route computes come from the same fields.
+    """
+    claimed = (claimed_terminal_id or "").strip() or None
+    decision = check(principal, IDENTITY_PROVE, claimed, hard=enforcing())
+    effective = principal
+    if not decision.allowed and claimed:
+        # Warn mode only (an enforcing ``check`` already raised): reproduce the
+        # pre-#965 behaviour of trusting the claimed id, visibly.
+        from cli_agent_orchestrator.security.principal import (
+            _row_by_id,
+            principal_from_terminal_row,
+        )
+
+        row = await asyncio.to_thread(_row_by_id, claimed)
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"terminal {claimed} not found",
+            )
+        effective = principal_from_terminal_row(row)
+    return {
+        "principal": principal_payload(effective),
+        "identity_bound": decision.allowed,
+        "claimed_terminal_id": claimed,
+        "rule": decision.rule,
+    }
 
 
 def _require_ephemeral_enabled(request: Request) -> Dict[str, Any]:

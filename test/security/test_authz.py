@@ -10,16 +10,21 @@ from cli_agent_orchestrator.security.authz import (
     CAO_MCP_SERVER,
     CAO_OPS_MCP_SERVER,
     DISCOVERY_TOOLS,
+    EPHEMERAL_DELEGATE,
+    EPHEMERAL_DEPTH,
     FLEET,
+    IDENTITY_PROVE,
     OPERATOR_ROUTE,
     RUN_CANCEL,
     RUN_REPLAY,
     RUN_RESUME,
     TERMINAL_ACT_AS,
     TERMINAL_CREATE,
+    TERMINAL_TARGET,
     TOOL_CALL,
     Decision,
     RunRef,
+    TerminalRef,
     authorize,
     check,
     enforcing,
@@ -29,7 +34,7 @@ from cli_agent_orchestrator.security.principal import Principal
 RW = frozenset({"cao:read", "cao:write"})
 
 
-def term(tid="t1", allowed=(), delegate=(), ancestors=()):
+def term(tid="t1", allowed=(), delegate=(), ancestors=(), ephemeral=False, resolved=True):
     return Principal(
         kind="terminal",
         scopes=RW,
@@ -37,6 +42,8 @@ def term(tid="t1", allowed=(), delegate=(), ancestors=()):
         allowed_tools=tuple(allowed),
         delegate_tools=tuple(delegate),
         ancestors=tuple(ancestors),
+        ephemeral=ephemeral,
+        allowlist_resolved=resolved,
     )
 
 
@@ -56,7 +63,20 @@ _RESOURCE_FOR = {
     RUN_REPLAY: RunRef("r", "other"),
     FLEET: "launch_session",
     OPERATOR_ROUTE: "shutdown",
+    TERMINAL_TARGET: TerminalRef("other", ()),
+    IDENTITY_PROVE: "someone-else",
+    EPHEMERAL_DEPTH: "create_ephemeral_agent",
+    EPHEMERAL_DELEGATE: "assign",
 }
+
+#: ``identity:prove`` is the one action an operator principal does NOT short
+#: circuit, and the exclusion is the point of the rule: the question is "did the
+#: bearer prove the terminal identity this process claims", and an operator or
+#: anonymous bearer proves no terminal identity at all. Answering it "allowed,
+#: operators are unbounded" is precisely the credential-fallback hole -- an agent
+#: launched without ``CAO_TERMINAL_TOKEN`` reaches the API as the operator and
+#: would then be handed the identity it merely asserted.
+_NOT_OPERATOR_SHORT_CIRCUITED = frozenset({IDENTITY_PROVE})
 
 
 class TestActionsExport:
@@ -71,11 +91,22 @@ class TestActionsExport:
 
 
 class TestOperatorPosture:
-    @pytest.mark.parametrize("action", sorted(ACTIONS))
+    @pytest.mark.parametrize("action", sorted(ACTIONS - _NOT_OPERATOR_SHORT_CIRCUITED))
     @pytest.mark.parametrize("p", [OPERATOR, ANON], ids=["operator", "anonymous"])
     def test_operator_and_anonymous_allowed_everything(self, p, action):
         d = authorize(p, action, _RESOURCE_FOR[action], server=CAO_OPS_MCP_SERVER)
         assert d.allowed and d.rule == "operator"
+
+    @pytest.mark.parametrize("p", [OPERATOR, ANON], ids=["operator", "anonymous"])
+    def test_an_operator_bearer_proves_no_terminal_identity(self, p):
+        d = authorize(p, IDENTITY_PROVE, "t1")
+        assert not d.allowed and d.rule == "identity:unproven"
+
+    @pytest.mark.parametrize("p", [OPERATOR, ANON], ids=["operator", "anonymous"])
+    def test_an_operator_bearer_claiming_nothing_is_fine(self, p):
+        """The operator shell: no ``CAO_TERMINAL_ID``, nothing to bind."""
+        d = authorize(p, IDENTITY_PROVE, None)
+        assert d.allowed and d.rule == "identity:unbound"
 
 
 class TestToolCall:
@@ -201,6 +232,115 @@ class TestActAs:
 
     def test_operator_may_act_as_anyone(self):
         assert authorize(OPERATOR, TERMINAL_ACT_AS, "t9").allowed
+
+
+class TestIdentityProve:
+    """Is the terminal id a process claims the one its bearer resolved to?"""
+
+    def test_the_bearers_own_id_is_proven(self):
+        d = authorize(term("t1"), IDENTITY_PROVE, "t1")
+        assert d.allowed and d.rule == "identity:proven"
+
+    def test_a_different_id_is_impersonation(self):
+        d = authorize(term("t1"), IDENTITY_PROVE, "t2")
+        assert not d.allowed and d.rule == "terminal:impersonation"
+        assert "t1" in d.reason and "t2" in d.reason
+
+    @pytest.mark.parametrize("claimed", ["", None])
+    def test_no_claim_is_the_operator_shell(self, claimed):
+        d = authorize(term("t1"), IDENTITY_PROVE, claimed)
+        assert d.allowed and d.rule == "identity:unbound"
+
+    def test_a_run_bearer_proves_its_spawning_terminal(self):
+        d = authorize(run_p("r1", "t1"), IDENTITY_PROVE, "t1")
+        assert d.allowed and d.rule == "identity:proven"
+
+
+class TestTerminalTarget:
+    """A terminal named as the target of an object-addressed route."""
+
+    REF = TerminalRef("leaf", ("mid", "root"))
+
+    def test_self_is_allowed(self):
+        d = authorize(term("leaf"), TERMINAL_TARGET, self.REF)
+        assert d.allowed and d.rule == "terminal:self"
+
+    def test_direct_creator_is_allowed(self):
+        d = authorize(term("mid"), TERMINAL_TARGET, self.REF)
+        assert d.allowed and d.rule == "terminal:descendant"
+
+    def test_transitive_creator_is_allowed(self):
+        d = authorize(term("root"), TERMINAL_TARGET, self.REF)
+        assert d.allowed and d.rule == "terminal:descendant"
+
+    def test_a_sibling_is_refused(self):
+        d = authorize(term("other"), TERMINAL_TARGET, self.REF)
+        assert not d.allowed and d.rule == "terminal:not-owner"
+        assert "leaf" in d.reason
+
+    def test_a_descendant_may_not_act_on_its_creator(self):
+        """Ancestry is one-directional: upward is not ownership."""
+        d = authorize(term("leaf"), TERMINAL_TARGET, TerminalRef("mid", ("root",)))
+        assert not d.allowed and d.rule == "terminal:not-owner"
+
+    def test_a_bad_resource_is_refused(self):
+        d = authorize(term("leaf"), TERMINAL_TARGET, "leaf")
+        assert not d.allowed and d.rule == "terminal:bad-resource"
+
+    def test_an_operator_may_target_anything(self):
+        assert authorize(OPERATOR, TERMINAL_TARGET, self.REF).allowed
+
+
+class TestEphemeralPolicy:
+    """``ephemeral.max_depth`` and ``ephemeral.child_may_delegate`` as rules.
+
+    Their effect is unchanged from the bare-string refusals they replace; what
+    is new is that a denial goes through ``check`` and therefore lands in the
+    audit log alongside every other decision.
+    """
+
+    def test_an_ephemeral_caller_may_not_create_ephemeral_agents(self):
+        d = authorize(term(ephemeral=True), EPHEMERAL_DEPTH, "create_ephemeral_agent")
+        assert not d.allowed and d.rule == "ephemeral:max-depth"
+
+    def test_a_normal_caller_may(self):
+        d = authorize(term(), EPHEMERAL_DEPTH, "create_ephemeral_agent")
+        assert d.allowed and d.rule == "ephemeral:within-depth"
+
+    def test_an_ephemeral_caller_may_not_delegate_by_default(self):
+        d = authorize(term(ephemeral=True), EPHEMERAL_DELEGATE, "assign", child_may_delegate=False)
+        assert not d.allowed and d.rule == "ephemeral:child-delegation"
+
+    def test_the_setting_lifts_it(self):
+        d = authorize(term(ephemeral=True), EPHEMERAL_DELEGATE, "assign", child_may_delegate=True)
+        assert d.allowed and d.rule == "ephemeral:may-delegate"
+
+    def test_a_non_ephemeral_caller_is_unaffected(self):
+        d = authorize(term(), EPHEMERAL_DELEGATE, "assign", child_may_delegate=False)
+        assert d.allowed and d.rule == "ephemeral:may-delegate"
+
+
+class TestUnresolvedAllowlist:
+    """An allowlist the server could not read is an unknown, not a deny-all."""
+
+    @pytest.mark.parametrize("action", [TOOL_CALL, TERMINAL_CREATE])
+    def test_allowlist_actions_are_refused(self, action):
+        d = authorize(term(resolved=False), action, _RESOURCE_FOR[action])
+        assert not d.allowed and d.rule == "identity:unresolved"
+
+    def test_even_a_callback_tool_is_refused(self):
+        """The callback carve-out assumes a known identity; this one is not."""
+        d = authorize(term(resolved=False), TOOL_CALL, "send_message")
+        assert not d.allowed and d.rule == "identity:unresolved"
+
+    def test_run_ownership_is_not_affected(self):
+        """An unreadable agent profile must not lock a terminal out of its own run."""
+        d = authorize(term("owner", resolved=False), RUN_CANCEL, RunRef("r1", "owner"))
+        assert d.allowed and d.rule == "run:owner"
+
+    def test_an_operator_is_not_affected(self):
+        p = Principal(kind="operator", scopes=RW, allowlist_resolved=False)
+        assert authorize(p, TOOL_CALL, "assign").allowed
 
 
 class TestRunActions:

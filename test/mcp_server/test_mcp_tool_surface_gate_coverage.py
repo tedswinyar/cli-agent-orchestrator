@@ -33,6 +33,7 @@ import asyncio
 import os
 import re
 from pathlib import Path
+from test.mcp_server.conftest import patch_identity
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -117,15 +118,8 @@ def _decide(mcp, tool_name, allowed_tools):
     async def call_next(_context):
         return sentinel
 
-    ctx = {
-        "terminal_id": "a1b2c3d4",
-        "session_name": "cao-session",
-        "provider": "codex",
-        "agent_profile": "worker",
-        "allowed_tools": allowed_tools,
-    }
     with patch.dict(os.environ, BOUND):
-        with patch.object(server, "_get_terminal_context_from_env", return_value=ctx):
+        with patch_identity(allowed_tools, terminal_id=BOUND["CAO_TERMINAL_ID"]):
             try:
                 assert asyncio.run(gate.on_call_tool(context, call_next)) is sentinel
                 return None

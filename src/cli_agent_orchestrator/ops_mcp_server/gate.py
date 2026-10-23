@@ -8,12 +8,15 @@ whatever its allowlist says: :func:`security.authz.authorize` refuses every
 ``tool:call`` on this server for ``terminal`` and ``run`` principals with rule
 ``fleet:operator-only`` and allows operator and anonymous principals.
 
-Identity comes from the environment the same way as on ``cao-mcp-server``: an
-unset ``CAO_TERMINAL_ID`` is the operator context and is never looked up, so
-the default-off posture (no credential at all) is byte-identical on the wire.
-A bound caller's terminal record is fetched over the same ``GET /terminals/{id}``
-hop the server already uses, and the decision is :func:`check` on the
-resulting principal.
+Identity comes from the BEARER, the same way as on ``cao-mcp-server``: an unset
+``CAO_TERMINAL_ID`` is the operator context and is never looked up, so the
+default-off posture (no credential at all) is byte-identical on the wire. A
+bound caller asks ``GET /me/principal`` with its claimed ``CAO_TERMINAL_ID``,
+the API refuses or audits a claim the bearer does not prove, and the decision
+is :func:`check` on the principal the API serialized. Fetching the row the
+claimed id names would authorize whoever that row belongs to, which is the
+substitution #965 exists to close -- and this module reached it through exactly
+the same ``GET /terminals/{id}`` hop that made it possible on the CAO server.
 
 Every ``@mcp.tool`` registration on this server (``server.py`` and
 ``decision_tools.py``) stacks ``@gated`` directly under it; the AST census in
@@ -31,21 +34,25 @@ from cli_agent_orchestrator.security.authz import CAO_OPS_MCP_SERVER
 logger = logging.getLogger(__name__)
 
 
-def _fetch_terminal_record(terminal_id: str) -> Optional[Dict[str, Any]]:
-    """``GET /terminals/{id}`` through the server's own request helper.
+def _fetch_caller_principal(claimed: str) -> Dict[str, Any]:
+    """``GET /me/principal?claimed_terminal_id=<claimed>`` via the server's helper.
 
     Imported lazily: ``server.py`` imports this module, so a top-level import
     here would be circular. ``_request_json`` returns errors rather than
-    raising; a ``None`` record with an error means the caller is unresolved.
+    raising, so any error becomes a ``RuntimeError`` the caller turns into a
+    fail-closed ``tool_gate.unresolved``.
     """
 
     from cli_agent_orchestrator.ops_mcp_server.server import _request_json
 
     data, error = _request_json(
-        "get", f"/terminals/{terminal_id}", operation="Resolve calling terminal"
+        "get",
+        "/me/principal",
+        params={"claimed_terminal_id": claimed},
+        operation="Resolve calling principal",
     )
     if error or not isinstance(data, dict):
-        raise RuntimeError(error or "invalid terminal record")
+        raise RuntimeError(error or "invalid principal payload")
     return data
 
 
@@ -62,7 +69,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         return None
 
     try:
-        record = _fetch_terminal_record(terminal_id)
+        principal = tool_gate.principal_for(_fetch_caller_principal(terminal_id))
     except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
         logger.warning("authorization lookup failed for ops tool '%s': %s", tool_name, e)
         return tool_gate.unresolved(
@@ -70,24 +77,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})",
             server=CAO_OPS_MCP_SERVER,
         )
-    if record is None:
-        return tool_gate.unresolved(
-            tool_name,
-            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
-            "terminal could not be resolved",
-            server=CAO_OPS_MCP_SERVER,
-        )
 
-    context = {
-        "terminal_id": record.get("id") or terminal_id,
-        "session_name": record.get("session_name"),
-        "agent_profile": record.get("agent_profile"),
-    }
-    # The ops rule does not read the allowlist (every terminal principal is
-    # refused), so the recorded list is passed as-is; a ``None`` is not resolved
-    # through the profile here because it cannot change the decision.
-    allowed = record.get("allowed_tools") or ()
-    principal = tool_gate.principal_for(context, allowed)
     return tool_gate.denial_for(principal, tool_name, server=CAO_OPS_MCP_SERVER)
 
 

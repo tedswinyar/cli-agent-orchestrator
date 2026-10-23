@@ -10,24 +10,32 @@ Two things these tests pin down, both from review on #769:
 * The policy is the one CAO already has. The effective list is the terminal's
   recorded ``allowed_tools``, or the profile resolution that ``None`` stands
   for, and the grant is the documented ``@cao-mcp-server`` selector or ``*``.
-* The guard fails closed. ``None`` from ``_get_terminal_context_from_env`` is
-  not proof of an operator context, so boundness comes from the environment.
+  That resolution now happens SERVER-SIDE, in
+  ``security.principal.principal_from_terminal_row``, so the body these tests
+  stub already carries the effective list; the profile-fallback cases moved to
+  ``test/security/test_principal.py`` with the code that performs them.
+* The guard fails closed. Any failure of the identity fetch -- an unreachable
+  server, a 401, a 404, a payload the deserializer rejects, an allowlist the
+  server could not resolve -- is an unknown, and boundness comes from the
+  environment rather than from the lookup succeeding.
 
 The seam under test is the MCP boundary, not ``_assign_impl`` /
 ``_handoff_impl``: those are shared with ``cao assign`` / ``cao handoff``,
 where the caller is a human operator and no agent allowlist applies.
+
+The identity stub is ``test/mcp_server/conftest.py::patch_identity``, shared
+with every other file that drives this gate.
 """
 
 import os
 import threading
+from test.mcp_server.conftest import identity_body, patch_identity
 from unittest.mock import Mock, patch
 
 import pytest
 import requests
 
 from cli_agent_orchestrator.mcp_server import server
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.models.terminal import Terminal
 
 BOUND = {"CAO_TERMINAL_ID": "a1b2c3d4"}
 DELEGATION_TOOLS = (
@@ -38,29 +46,6 @@ DELEGATION_TOOLS = (
     "workflow_resume",
     "workflow_start",
 )
-
-
-def _ctx(allowed_tools=None, profile_name="worker"):
-    return {
-        "terminal_id": "a1b2c3d4",
-        "session_name": "cao-session",
-        "provider": "codex",
-        "agent_profile": profile_name,
-        "allowed_tools": allowed_tools,
-    }
-
-
-def _profile(name="worker", allowed_tools=None, role=None):
-    return AgentProfile(
-        name=name, description="test profile", allowedTools=allowed_tools, role=role
-    )
-
-
-def _patch_profile(profile):
-    return patch(
-        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
-        return_value=profile,
-    )
 
 
 def _unbound_env():
@@ -77,7 +62,7 @@ class TestOperatorContext:
 
     def test_unset_terminal_id_does_not_even_look_up(self, tool):
         with patch.dict(os.environ, _unbound_env(), clear=True):
-            with patch.object(server, "_get_terminal_context_from_env") as lookup:
+            with patch.object(server, "_caller_principal") as lookup:
                 assert server._tool_denied_reason(tool) is None
             lookup.assert_not_called()
 
@@ -88,34 +73,28 @@ class TestFailsClosed:
 
     def test_transport_failure_denies(self, tool):
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server,
-                "_get_terminal_context_from_env",
-                side_effect=requests.RequestException("cao-server down"),
-            ):
+            with patch_identity(side_effect=requests.RequestException("cao-server down")):
                 reason = server._tool_denied_reason(tool)
         assert reason is not None
         assert tool in reason
 
     def test_unexpected_error_denies(self, tool):
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server, "_get_terminal_context_from_env", side_effect=RuntimeError("boom")
-            ):
+            with patch_identity(side_effect=RuntimeError("boom")):
                 assert server._tool_denied_reason(tool) is not None
 
     def test_bound_caller_that_does_not_resolve_denies(self, tool):
-        """A malformed CAO_TERMINAL_ID and a 404 both arrive here as None."""
+        """A malformed CAO_TERMINAL_ID and a 404 both arrive here as an HTTP error."""
         with patch.dict(os.environ, BOUND):
-            with patch.object(server, "_get_terminal_context_from_env", return_value=None):
+            with patch_identity(side_effect=requests.HTTPError("404 for /me/principal")):
                 reason = server._tool_denied_reason(tool)
         assert reason is not None
-        assert "CAO_TERMINAL_ID" in reason
+        assert "the calling terminal could not be resolved" in reason
 
     def test_unreadable_profile_denies(self, tool):
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
+                patch_identity(allowlist_resolved=False),
                 patch(
                     "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
                     side_effect=FileNotFoundError("no such profile"),
@@ -126,11 +105,7 @@ class TestFailsClosed:
     def test_unresolvable_policy_denies(self, tool):
         """Recorded None with no profile to fall back to cannot be resolved."""
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server,
-                "_get_terminal_context_from_env",
-                return_value=_ctx(profile_name=None),
-            ):
+            with patch_identity(agent_profile=None, allowlist_resolved=False):
                 assert server._tool_denied_reason(tool) is not None
 
 
@@ -140,23 +115,19 @@ class TestRecordedPolicy:
 
     def test_server_selector_grants(self, tool):
         with patch.dict(os.environ, BOUND):
-            with patch.object(
-                server,
-                "_get_terminal_context_from_env",
-                return_value=_ctx(["fs_read", "@cao-mcp-server"]),
-            ):
+            with patch_identity(["fs_read", "@cao-mcp-server"]):
                 assert server._tool_denied_reason(tool) is None
 
     def test_wildcard_grants(self, tool):
         with patch.dict(os.environ, BOUND):
-            with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(["*"])):
+            with patch_identity(["*"]):
                 assert server._tool_denied_reason(tool) is None
 
     @pytest.mark.parametrize("allowed", [[], ["fs_read"], ["@transport-sim"], ["@inventory"]])
     def test_narrow_list_denies(self, tool, allowed):
         """A narrow --allowed-tools grant is now enforced against these tools."""
         with patch.dict(os.environ, BOUND):
-            with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(allowed)):
+            with patch_identity(allowed):
                 reason = server._tool_denied_reason(tool)
         assert reason is not None
         assert "@cao-mcp-server" in reason
@@ -164,38 +135,40 @@ class TestRecordedPolicy:
     def test_bare_tool_name_does_not_grant(self, tool):
         """MCP tools are granted by server selector, never by bare name."""
         with patch.dict(os.environ, BOUND):
-            with patch.object(server, "_get_terminal_context_from_env", return_value=_ctx([tool])):
+            with patch_identity([tool]):
                 assert server._tool_denied_reason(tool) is not None
 
 
 @pytest.mark.parametrize("tool", DELEGATION_TOOLS)
-class TestProfileFallback:
-    """Recorded None means resolve from the profile, matching create_terminal."""
+class TestProfileFallbackArrivesResolved:
+    """Recorded ``None`` means "resolve from the profile" -- on the SERVER.
 
-    def test_profile_allowed_tools_grant(self, tool):
+    The resolution itself moved into ``principal_from_terminal_row`` when the
+    gate stopped constructing its own principal (``test_principal.py``:
+    ``TestEffectiveAllowlist``), so what the gate must get right is the two
+    outcomes of that resolution: a resolved list is obeyed, and a FAILED
+    resolution is an unknown rather than an empty allowlist. The second half is
+    the interesting one: ``allowed_tools=()`` with ``allowlist_resolved=False``
+    would otherwise read as a perfectly legitimate deny-all, and a deny-all is
+    indistinguishable from "we never read the list" by the allowlist rule alone.
+    """
+
+    def test_a_resolved_profile_grant_passes(self, tool):
         with patch.dict(os.environ, BOUND):
-            with (
-                patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
-                _patch_profile(_profile(allowed_tools=["@cao-mcp-server"])),
-            ):
+            with patch_identity(["@cao-mcp-server"]):
                 assert server._tool_denied_reason(tool) is None
 
-    def test_profile_allowed_tools_deny(self, tool):
+    def test_a_resolved_profile_deny_refuses(self, tool):
         with patch.dict(os.environ, BOUND):
-            with (
-                patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
-                _patch_profile(_profile(allowed_tools=["fs_read"])),
-            ):
+            with patch_identity(["fs_read"]):
                 assert server._tool_denied_reason(tool) is not None
 
-    def test_role_default_grants(self, tool):
-        """ROLE_TOOL_DEFAULTS gives developer @cao-mcp-server, so a role-only profile passes."""
+    def test_a_failed_resolution_is_unresolved_not_deny_all(self, tool):
         with patch.dict(os.environ, BOUND):
-            with (
-                patch.object(server, "_get_terminal_context_from_env", return_value=_ctx()),
-                _patch_profile(_profile(role="developer")),
-            ):
-                assert server._tool_denied_reason(tool) is None
+            with patch_identity(allowlist_resolved=False):
+                reason = server._tool_denied_reason(tool)
+        assert reason is not None
+        assert "identity:unresolved" in reason
 
 
 class TestToolsRefuse:
@@ -205,9 +178,7 @@ class TestToolsRefuse:
     async def test_assign_refuses_and_never_reaches_the_impl(self):
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(
-                    server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-                ),
+                patch_identity(["fs_read"]),
                 patch.object(server, "_assign_impl") as impl,
             ):
                 result = await server.assign(agent_profile="developer", message="do work")
@@ -219,9 +190,7 @@ class TestToolsRefuse:
     async def test_handoff_refuses_and_never_reaches_the_impl(self):
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(
-                    server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-                ),
+                patch_identity(["fs_read"]),
                 patch.object(server, "_handoff_impl") as impl,
             ):
                 result = await server.handoff(agent_profile="developer", message="do work")
@@ -233,7 +202,7 @@ class TestToolsRefuse:
     async def test_assign_runs_for_a_granted_caller(self):
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(["*"])),
+                patch_identity(["*"]),
                 patch.object(server, "_assign_impl", return_value={"success": True}) as impl,
             ):
                 result = await server.assign(agent_profile="developer", message="do work")
@@ -260,9 +229,7 @@ class TestAssignElastic:
         self._broker(monkeypatch)
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(
-                    server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
-                ),
+                patch_identity(["fs_read"]),
                 patch.object(server, "_current_terminal_id", return_value="a1b2c3d4"),
                 patch.object(server.requests, "post") as post,
                 patch.object(server, "_assign_impl") as impl,
@@ -279,13 +246,13 @@ class TestAssignElastic:
         self._broker(monkeypatch)
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(server, "_get_terminal_context_from_env", return_value=None),
+                patch_identity(side_effect=requests.HTTPError("404 for /me/principal")),
                 patch.object(server, "_current_terminal_id", return_value="a1b2c3d4"),
                 patch.object(server.requests, "post") as post,
             ):
                 result = await server.assign_elastic(agent_profile="developer", message="do work")
         assert result["success"] is False
-        assert "CAO_TERMINAL_ID" in result["message"]
+        assert "the calling terminal could not be resolved" in result["message"]
         post.assert_not_called()
 
     @pytest.mark.asyncio
@@ -301,11 +268,7 @@ class TestAssignElastic:
         }
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(
-                    server,
-                    "_get_terminal_context_from_env",
-                    return_value=_ctx(["fs_read", "@cao-mcp-server"]),
-                ),
+                patch_identity(["fs_read", "@cao-mcp-server"]),
                 patch.object(server, "_current_terminal_id", return_value="a1b2c3d4"),
                 patch.object(server.requests, "post", return_value=lease) as post,
                 patch.object(
@@ -320,20 +283,20 @@ class TestAssignElastic:
 
     @pytest.mark.asyncio
     async def test_resolves_the_caller_off_the_event_loop(self, monkeypatch):
-        # For a bound caller the guard reaches ``_get_terminal_context_from_env``,
-        # which makes blocking HTTP calls. On the loop thread it would stall every
-        # other placement in a fan-out until those calls returned.
+        # For a bound caller the guard reaches ``_caller_principal``, which makes a
+        # blocking HTTP call. On the loop thread it would stall every other
+        # placement in a fan-out until that call returned.
         self._broker(monkeypatch)
         loop_thread = threading.get_ident()
         seen = []
 
-        def ctx():
+        def ctx(_claimed):
             seen.append(threading.get_ident())
-            return _ctx(["fs_read"])
+            return identity_body(["fs_read"])
 
         with patch.dict(os.environ, BOUND):
             with (
-                patch.object(server, "_get_terminal_context_from_env", side_effect=ctx),
+                patch.object(server, "_caller_principal", side_effect=ctx),
                 patch.object(server.requests, "post") as post,
             ):
                 result = await server.assign_elastic(agent_profile="developer", message="do work")
@@ -342,55 +305,60 @@ class TestAssignElastic:
         post.assert_not_called()
 
 
-class TestThroughTheRealContextHelper:
-    """The other classes stub ``_get_terminal_context_from_env``, so nothing there
-    exercises the terminal record actually carrying ``allowed_tools``. These drive
-    the real helper against the payload ``GET /terminals/{id}`` returns, which is a
-    ``Terminal`` (``response_model=Terminal``).
+class TestThroughTheRealIdentityFetch:
+    """The other classes stub ``_caller_principal``, so nothing there exercises the
+    body ``GET /me/principal`` actually serves. These drive the real
+    ``_caller_principal`` against that body, built by the production serializer
+    from the production constructor, so the wire shape and the gate's reader
+    cannot drift apart.
     """
 
     @staticmethod
-    def _payload(allowed_tools):
-        return Terminal(
-            id="a1b2c3d4",
-            name="w1",
-            provider="codex",
-            session_name="cao-session",
-            agent_profile="worker",
-            allowed_tools=allowed_tools,
-        ).model_dump(mode="json")
+    def _payload(allowed_tools, *, identity_bound=True):
+        return identity_body(allowed_tools, identity_bound=identity_bound)
 
     def test_recorded_policy_reaches_the_guard(self):
         payload = self._payload(["fs_read", "@cao-mcp-server"])
         with patch.dict(os.environ, BOUND):
-            with (
-                patch.object(server.mcp_utils, "get_json", return_value=payload),
-                patch("requests.get", side_effect=RuntimeError("skip working-dir probe")),
-            ):
-                ctx = server._get_terminal_context_from_env()
-                assert ctx["allowed_tools"] == ["fs_read", "@cao-mcp-server"]
+            with patch.object(server.mcp_utils, "get_json", return_value=payload):
                 assert server._tool_denied_reason("assign") is None
 
-    def test_narrow_recorded_policy_denies_through_the_real_helper(self):
+    def test_narrow_recorded_policy_denies_through_the_real_fetch(self):
         payload = self._payload(["fs_read"])
         with patch.dict(os.environ, BOUND):
-            with (
-                patch.object(server.mcp_utils, "get_json", return_value=payload),
-                patch("requests.get", side_effect=RuntimeError("skip working-dir probe")),
-            ):
+            with patch.object(server.mcp_utils, "get_json", return_value=payload):
                 reason = server._tool_denied_reason("assign")
         assert reason is not None
         assert "@cao-mcp-server" in reason
 
+    def test_the_claim_travels_as_a_query_parameter(self):
+        """The server cannot bind an id it is never shown."""
+        payload = self._payload(["*"])
+        with patch.dict(os.environ, BOUND):
+            with patch.object(server.mcp_utils, "get_json", return_value=payload) as get_json:
+                assert server._tool_denied_reason("assign") is None
+        assert get_json.call_args.args[0] == "/me/principal"
+        assert get_json.call_args.kwargs["claimed_terminal_id"] == BOUND["CAO_TERMINAL_ID"]
+
+    def test_a_body_without_a_principal_fails_closed(self):
+        with patch.dict(os.environ, BOUND):
+            with patch.object(server.mcp_utils, "get_json", return_value={"identity_bound": True}):
+                reason = server._tool_denied_reason("assign")
+        assert reason is not None
+        assert "could not be resolved" in reason
+
+    def test_a_non_object_body_fails_closed(self):
+        with patch.dict(os.environ, BOUND):
+            with patch.object(server.mcp_utils, "get_json", return_value=["nope"]):
+                reason = server._tool_denied_reason("assign")
+        assert reason is not None
+        assert "could not be resolved" in reason
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("tool", DELEGATION_TOOLS)
-    @pytest.mark.parametrize("provider", ["copilot_cli", "claude_code"])
     @pytest.mark.parametrize("allowed_tools", [[], ["fs_read"], ["@transport-sim"], ["@inventory"]])
-    async def test_restricted_profiles_cannot_dispatch_through_any_route(
-        self, tool, provider, allowed_tools
-    ):
+    async def test_restricted_profiles_cannot_dispatch_through_any_route(self, tool, allowed_tools):
         payload = self._payload(allowed_tools)
-        payload["provider"] = provider
         with patch.dict(os.environ, BOUND):
             with (
                 patch.object(server.mcp_utils, "get_json", return_value=payload),

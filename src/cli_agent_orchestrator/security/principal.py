@@ -8,8 +8,13 @@ terminal an identity the *server* issued and can verify:
   digest; only the digest is stored (``terminals.credential_digest``), so a
   database read never yields a usable credential.
 * :func:`principal_from_terminal_row` turns a terminal row into a frozen
-  :class:`Principal` carrying the row's allowlist, delegation ceiling, creator
-  and ancestry (``caller_id`` followed up the table, bounded, cycle-safe).
+  :class:`Principal` carrying the row's EFFECTIVE allowlist, delegation
+  ceiling, creator and ancestry (``caller_id`` followed up the table, bounded,
+  cycle-safe). It is the **only** function in the tree that builds a
+  ``terminal`` principal: :func:`principal_payload` /
+  :func:`principal_from_payload` carry its result over HTTP to the MCP
+  boundary, which therefore cannot construct a second, differently-populated
+  one (the seam that let ``delegate_tools`` go missing on the MCP side).
 * :func:`get_current_principal` is the FastAPI dependency that resolves a
   request's bearer to a principal. Anything today's
   :func:`security.auth.get_current_scopes` accepts is still accepted here and
@@ -30,7 +35,7 @@ import json
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional, Tuple
+from typing import Any, Callable, Literal, Mapping, Optional, Tuple
 
 from fastapi import Depends, HTTPException, Request, status
 
@@ -66,6 +71,17 @@ class Principal:
     creator_id: Optional[str] = None
     ancestors: tuple[str, ...] = ()
     run_id: Optional[str] = None
+    #: Ephemeral-registry membership of the terminal (``terminals.ephemeral`` as
+    #: the API publishes it). Policy, not decoration: the ``ephemeral:*`` rules
+    #: in :mod:`security.authz` read it, so those refusals go through
+    #: :func:`security.authz.check` and are audited like every other decision.
+    ephemeral: bool = False
+    #: False when the row said "resolve the allowlist from the agent profile"
+    #: and that resolution failed. ``allowed_tools`` is then ``()``, which the
+    #: policy layer would otherwise read as a legitimate deny-all; the flag
+    #: lets :func:`security.authz.authorize` refuse with ``identity:unresolved``
+    #: instead of silently deciding on a list it never read.
+    allowlist_resolved: bool = True
 
     @property
     def is_operator(self) -> bool:
@@ -165,18 +181,72 @@ def _ancestry(terminal_id: Optional[str], first_caller: Optional[str]) -> tuple[
     return tuple(chain)
 
 
+def _is_ephemeral(terminal_id: str) -> bool:
+    """Ephemeral-registry membership for ``terminal_id``.
+
+    Deliberately NOT guarded. A registry that cannot answer is an unknown, and
+    "not ephemeral" is the permissive answer -- it is what lifts the
+    ``ephemeral.max_depth`` and ``ephemeral.child_may_delegate`` refusals. The
+    exception therefore propagates: the route 500s, and the MCP gate turns that
+    into ``tool_gate.unresolved``, which is what ``GET /terminals/{id}`` did
+    before the principal existed (``test_ephemeral_caller_denial.py::
+    test_registry_lookup_failure_denies``).
+    """
+
+    from cli_agent_orchestrator.clients import database
+
+    return bool(database.is_ephemeral_terminal(terminal_id))
+
+
+def _effective_allowed(row: Any) -> Tuple[tuple[str, ...], bool]:
+    """``(effective allowlist, resolved?)`` for a terminal row.
+
+    A recorded ``allowed_tools`` IS the effective list -- including ``[]``,
+    which is an explicit deny-all. A recorded ``None`` means "resolve from the
+    agent profile", exactly as ``create_terminal`` and the MCP gate have always
+    read it (``utils.caller_tools.caller_effective_allowed_tools``), so the
+    resolution happens HERE rather than being repeated by every surface that
+    needs a principal. An unreadable profile, or a profile that resolves to
+    ``None``, is reported as unresolved so the policy layer can fail closed
+    instead of mistaking it for deny-all.
+    """
+
+    recorded = getattr(row, "allowed_tools", None)
+    if recorded is not None:
+        return _as_tuple(recorded), True
+
+    from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
+
+    profile = getattr(row, "agent_profile", None)
+    try:
+        resolved = caller_effective_allowed_tools({"allowed_tools": None, "agent_profile": profile})
+    except Exception:  # noqa: BLE001  (an unknown result must not become permission)
+        logger.warning("allowlist resolution failed for profile %r", profile, exc_info=True)
+        return (), False
+    if resolved is None:
+        return (), False
+    return tuple(str(r) for r in resolved), True
+
+
 def principal_from_terminal_row(row: Any) -> Principal:
     """Build a ``terminal`` principal from a ``TerminalModel`` row.
 
-    Fresh each call, no caching: the row is the source of truth and a
-    principal is a snapshot of it at resolve time. ``delegate_tools`` (#948) is
-    read when the row has it and is empty otherwise, which the policy layer
-    reads as "ceiling = own allowlist".
+    THE one construction path. Fresh each call, no caching: the row is the
+    source of truth and a principal is a snapshot of it at resolve time.
+
+    * ``allowed_tools`` is the EFFECTIVE list (see :func:`_effective_allowed`),
+      so an HTTP route and the MCP gate bound the same terminal by the same
+      list. Before this was centralised the MCP gate resolved the profile and
+      the API did not, and a row with ``allowed_tools=None`` was unrestricted
+      on one surface and deny-all on the other.
+    * ``delegate_tools`` (#948) is the recorded delegation ceiling; empty means
+      "ceiling = own allowlist" to :func:`security.authz.ceiling_of`.
     """
 
     terminal_id = str(row.id)
     caller_id = getattr(row, "caller_id", None)
     creator = str(caller_id) if caller_id else None
+    allowed, resolved = _effective_allowed(row)
     return Principal(
         kind="terminal",
         scopes=AGENT_SCOPES,
@@ -184,10 +254,84 @@ def principal_from_terminal_row(row: Any) -> Principal:
         session_name=getattr(row, "tmux_session", None),
         agent_profile=getattr(row, "agent_profile", None),
         role=getattr(row, "role", None),
-        allowed_tools=_as_tuple(getattr(row, "allowed_tools", None)),
+        allowed_tools=allowed,
         delegate_tools=_as_tuple(getattr(row, "delegate_tools", None)),
         creator_id=creator,
         ancestors=_ancestry(terminal_id, creator),
+        ephemeral=_is_ephemeral(terminal_id),
+        allowlist_resolved=resolved,
+    )
+
+
+# --- serialization (the API -> MCP boundary) --------------------------------
+
+#: Field order is the dataclass's own; stated once so the payload keys and the
+#: constructor cannot drift. ``scopes`` is excluded on purpose: it is derived
+#: (:data:`AGENT_SCOPES` for every agent principal) and a wire-supplied scope
+#: set would be a privilege the holder named for itself.
+_PAYLOAD_FIELDS: tuple[str, ...] = (
+    "kind",
+    "terminal_id",
+    "session_name",
+    "agent_profile",
+    "role",
+    "allowed_tools",
+    "delegate_tools",
+    "creator_id",
+    "ancestors",
+    "run_id",
+    "ephemeral",
+    "allowlist_resolved",
+)
+
+
+def principal_payload(principal: Principal) -> dict[str, Any]:
+    """Serialize a principal for the ``GET /me/principal`` body.
+
+    Lists rather than tuples so the result is plain JSON. ``scopes`` is not on
+    the wire; see :data:`_PAYLOAD_FIELDS`.
+    """
+
+    out: dict[str, Any] = {}
+    for field in _PAYLOAD_FIELDS:
+        value = getattr(principal, field)
+        out[field] = list(value) if isinstance(value, tuple) else value
+    return out
+
+
+def principal_from_payload(payload: Mapping[str, Any]) -> Principal:
+    """Rebuild a principal from :func:`principal_payload`.
+
+    The inverse, used by the MCP boundary, which never touches
+    ``clients.database``. ``scopes`` is reconstructed, not read: an agent
+    principal always holds exactly :data:`AGENT_SCOPES`, and an ``operator`` or
+    ``anonymous`` kind on the wire is the unbounded caller the server itself
+    resolved, so it gets :data:`auth.FULL_SCOPE_SET`.
+
+    An unknown ``kind`` is refused rather than defaulted: a payload this
+    function cannot interpret must not become a principal.
+    """
+
+    kind = str(payload.get("kind") or "")
+    if kind not in ("operator", "terminal", "run", "anonymous"):
+        raise ValueError(f"unknown principal kind {kind!r}")
+    scopes = (
+        frozenset(FULL_SCOPE_SET) if kind in ("operator", "anonymous") else frozenset(AGENT_SCOPES)
+    )
+    return Principal(
+        kind=kind,  # type: ignore[arg-type]
+        scopes=scopes,
+        terminal_id=payload.get("terminal_id"),
+        session_name=payload.get("session_name"),
+        agent_profile=payload.get("agent_profile"),
+        role=payload.get("role"),
+        allowed_tools=_as_tuple(payload.get("allowed_tools")),
+        delegate_tools=_as_tuple(payload.get("delegate_tools")),
+        creator_id=payload.get("creator_id"),
+        ancestors=_as_tuple(payload.get("ancestors")),
+        run_id=payload.get("run_id"),
+        ephemeral=bool(payload.get("ephemeral")),
+        allowlist_resolved=bool(payload.get("allowlist_resolved", True)),
     )
 
 
@@ -253,6 +397,8 @@ def _resolve_run_token(token: str) -> Principal:
         creator_id=base.creator_id,
         ancestors=base.ancestors,
         run_id=str(run_id),
+        ephemeral=base.ephemeral,
+        allowlist_resolved=base.allowlist_resolved,
     )
 
 

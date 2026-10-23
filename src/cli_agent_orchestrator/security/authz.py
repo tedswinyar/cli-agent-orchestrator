@@ -35,25 +35,46 @@ CAO_OPS_MCP_SERVER = "cao-ops-mcp-server"
 TOOL_CALL = "tool:call"
 TERMINAL_CREATE = "terminal:create"
 TERMINAL_ACT_AS = "terminal:act_as"
+TERMINAL_TARGET = "terminal:target"
 RUN_CANCEL = "run:cancel"
 RUN_RESUME = "run:resume"
 RUN_REPLAY = "run:replay"
 FLEET = "fleet:*"
 OPERATOR_ROUTE = "operator:route"
+#: An ``CAO_TERMINAL_ID`` claimed by a process whose bearer resolves to no
+#: terminal at all. Separate from :data:`TERMINAL_ACT_AS` (which compares two
+#: known identities) because the failure is different: nothing was proven, so
+#: there is no "from" identity to name in the refusal.
+IDENTITY_PROVE = "identity:prove"
+#: The two ephemeral-launch policy rules (``ephemeral.max_depth``,
+#: ``ephemeral.child_may_delegate``). They were enforced before
+#: ``CAO_PRINCIPAL_ENFORCE`` existed and are unchanged in effect; routing them
+#: through :func:`check` is what puts them in the audit log.
+EPHEMERAL_DEPTH = "ephemeral:depth"
+EPHEMERAL_DELEGATE = "ephemeral:delegate"
 
 ACTIONS: frozenset[str] = frozenset(
     {
         TOOL_CALL,
         TERMINAL_CREATE,
         TERMINAL_ACT_AS,
+        TERMINAL_TARGET,
         RUN_CANCEL,
         RUN_RESUME,
         RUN_REPLAY,
         FLEET,
         OPERATOR_ROUTE,
+        IDENTITY_PROVE,
+        EPHEMERAL_DEPTH,
+        EPHEMERAL_DELEGATE,
     }
 )
 _RUN_ACTIONS: frozenset[str] = frozenset({RUN_CANCEL, RUN_RESUME, RUN_REPLAY})
+#: Actions whose decision reads ``principal.allowed_tools``. An unresolved
+#: allowlist is refused for these and only these: a run-ownership or
+#: identity-binding question does not consult the list, so failing those closed
+#: would turn an unreadable agent profile into a lockout.
+_ALLOWLIST_ACTIONS: frozenset[str] = frozenset({TOOL_CALL, TERMINAL_CREATE})
 
 #: Tools a terminal principal may always call on ``cao-mcp-server`` regardless
 #: of its allowlist: the callbacks a bounded agent needs to report back to its
@@ -83,6 +104,20 @@ class Decision:
 class RunRef:
     run_id: str
     owner_terminal_id: Optional[str]
+    ancestor_terminal_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TerminalRef:
+    """A terminal named as the TARGET of a request, with its creator chain.
+
+    ``ancestor_terminal_ids`` is the target's ``caller_id`` chain (creator,
+    creator's creator, ... root) as ``principal._ancestry`` computes it, so
+    "a descendant the caller created" is a membership test rather than a
+    downward walk.
+    """
+
+    terminal_id: str
     ancestor_terminal_ids: tuple[str, ...] = ()
 
 
@@ -190,10 +225,41 @@ def authorize(principal: Principal, action: str, resource: Any, **ctx: Any) -> D
     if action not in ACTIONS:
         return Decision(False, "unknown-action", f"unknown action {action!r}")
 
+    if action == IDENTITY_PROVE:
+        # Asked BEFORE the operator short-circuit on purpose: the question is
+        # "did the bearer prove the identity this process claims", and an
+        # operator or anonymous bearer proves no terminal identity at all. That
+        # is the credential-fallback hole (an agent launched without
+        # CAO_TERMINAL_TOKEN reaching the API as the operator), so it must not
+        # be answered "allowed, operators are unbounded".
+        claimed = str(resource) if resource is not None else None
+        if not claimed:
+            return Decision(True, "identity:unbound", "no terminal identity is claimed")
+        if principal.terminal_id == claimed:
+            return Decision(True, "identity:proven", f"the bearer is terminal {claimed}")
+        if principal.terminal_id:
+            return Decision(
+                False,
+                "terminal:impersonation",
+                f"terminal {principal.terminal_id} may not act as terminal {claimed}",
+            )
+        return Decision(
+            False,
+            "identity:unproven",
+            f"a {principal.kind} bearer does not prove the claimed identity {claimed}",
+        )
+
     if principal.is_operator:
         return Decision(True, "operator", f"{principal.kind} principals are unbounded")
 
     who = _who(principal)
+
+    if action in _ALLOWLIST_ACTIONS and not principal.allowlist_resolved:
+        return Decision(
+            False,
+            "identity:unresolved",
+            f"{who} effective allowed_tools could not be resolved from its agent profile",
+        )
 
     if action == TOOL_CALL:
         tool = str(resource)
@@ -233,6 +299,45 @@ def authorize(principal: Principal, action: str, resource: Any, **ctx: Any) -> D
         if claimed and principal.terminal_id and claimed == principal.terminal_id:
             return Decision(True, "terminal:self", f"{who} acts as itself")
         return Decision(False, "terminal:impersonation", f"{who} may not act as terminal {claimed}")
+
+    if action == TERMINAL_TARGET:
+        if not isinstance(resource, TerminalRef):
+            return Decision(False, "terminal:bad-resource", f"{action} requires a TerminalRef")
+        tid = principal.terminal_id
+        if tid and tid == resource.terminal_id:
+            return Decision(True, "terminal:self", f"{who} acts on itself")
+        if tid and tid in resource.ancestor_terminal_ids:
+            return Decision(
+                True,
+                "terminal:descendant",
+                f"{who} created terminal {resource.terminal_id} (directly or transitively)",
+            )
+        return Decision(
+            False,
+            "terminal:not-owner",
+            f"{who} neither is nor created terminal {resource.terminal_id}",
+        )
+
+    if action == EPHEMERAL_DEPTH:
+        if principal.ephemeral:
+            return Decision(
+                False,
+                "ephemeral:max-depth",
+                f"{who} is ephemeral and may not create ephemeral agents "
+                "(ephemeral.max_depth=1)",
+            )
+        return Decision(True, "ephemeral:within-depth", f"{who} is not an ephemeral agent")
+
+    if action == EPHEMERAL_DELEGATE:
+        # ``resource`` is the tool name; ``ctx['child_may_delegate']`` the setting.
+        if principal.ephemeral and not bool(ctx.get("child_may_delegate")):
+            return Decision(
+                False,
+                "ephemeral:child-delegation",
+                f"{who} is ephemeral and ephemeral.child_may_delegate is off, so "
+                f"{resource} is not permitted",
+            )
+        return Decision(True, "ephemeral:may-delegate", f"{who} may delegate {resource}")
 
     if action in _RUN_ACTIONS:
         if not isinstance(resource, RunRef):
@@ -298,6 +403,8 @@ def check(
 def _resource_repr(resource: Any, ctx: dict[str, Any]) -> str:
     if isinstance(resource, RunRef):
         base = f"run:{resource.run_id}"
+    elif isinstance(resource, TerminalRef):
+        base = f"terminal:{resource.terminal_id}"
     elif isinstance(resource, (list, tuple)):
         base = ",".join(str(r) for r in resource)
     else:

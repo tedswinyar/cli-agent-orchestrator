@@ -17,15 +17,17 @@ What these pin down, on the tree where #972's middleware and the demo's
   carry the decorator, so a direct call still gets their pinned envelopes;
   nothing else is decided twice.
 
-The seam is the same as ``test_tool_allowlist_enforcement.py``: the terminal
-record is stubbed at ``_get_terminal_context_from_env`` and the recorded
-``allowed_tools`` is the effective list.
+The seam is the same as ``test_tool_allowlist_enforcement.py``: the identity is
+stubbed at ``_caller_principal`` through the shared
+``test/mcp_server/conftest.py::patch_identity`` builder, and the body it returns
+carries the EFFECTIVE allowlist, which is what ``GET /me/principal`` serves.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+from test.mcp_server.conftest import identity_body, patch_identity
 from test.security.test_tool_gate_census import EXPECTED_CAO_TOOLS
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,16 +53,6 @@ TERMINAL_ID = "a1b2c3d4"
 #: main since #769 with envelopes their callers pin, and reachable by a direct
 #: call that never passes through FastMCP dispatch.
 DELEGATION_TOOLS = frozenset(tool_gate.LEGACY_HARD_GATED - {"create_ephemeral_agent"})
-
-
-def _ctx(allowed_tools):
-    return {
-        "terminal_id": TERMINAL_ID,
-        "session_name": "cao-session",
-        "provider": "codex",
-        "agent_profile": "worker",
-        "allowed_tools": allowed_tools,
-    }
 
 
 @pytest.fixture
@@ -92,7 +84,14 @@ def bound(monkeypatch):
 
 
 def _with_allowlist(allowed):
-    return patch.object(server, "_get_terminal_context_from_env", return_value=_ctx(allowed))
+    return patch_identity(allowed, terminal_id=TERMINAL_ID)
+
+
+def _unresolvable():
+    """The identity fetch failing: the server is down, or the bearer proves nothing."""
+    import requests
+
+    return patch_identity(side_effect=requests.RequestException("cao-server unreachable"))
 
 
 def _gate():
@@ -256,10 +255,10 @@ class TestHardWhateverTheFlag:
         assert reason is not None and "@cao-mcp-server" in reason
 
     def test_unresolvable_identity_fails_closed_for_every_tool(self, either_mode, bound):
-        with patch.object(server, "_get_terminal_context_from_env", return_value=None):
+        with _unresolvable():
             for tool in ("memory_forget", "assign", "tool_from_a_later_pr"):
                 reason = server._tool_denied_reason(tool)
-                assert reason is not None and "CAO_TERMINAL_ID" in reason, tool
+                assert reason is not None and "could not be resolved" in reason, tool
 
 
 # --- through #972's middleware ----------------------------------------------------------
@@ -267,7 +266,7 @@ class TestHardWhateverTheFlag:
 
 class TestThroughTheMiddleware:
     def test_refuses_with_the_decision_reason(self, either_mode, bound):
-        principal = tool_gate.principal_for(_ctx(["fs_read"]), ["fs_read"])
+        principal = tool_gate.principal_for(identity_body(["fs_read"], terminal_id=TERMINAL_ID))
         expected = authorize(principal, TOOL_CALL, "memory_forget", server=CAO_MCP_SERVER)
         with _with_allowlist(["fs_read"]):
             with pytest.raises(ToolError) as ei:
@@ -283,13 +282,13 @@ class TestThroughTheMiddleware:
                 _dispatch("find_profiles")
 
     def test_unresolvable_identity_fails_closed(self, either_mode, bound):
-        with patch.object(server, "_get_terminal_context_from_env", return_value=None):
-            with pytest.raises(ToolError, match="CAO_TERMINAL_ID"):
+        with _unresolvable():
+            with pytest.raises(ToolError, match="could not be resolved"):
                 _dispatch("memory_forget")
 
     def test_operator_context_is_untouched(self, either_mode, monkeypatch):
         monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
-        with patch.object(server, "_get_terminal_context_from_env") as lookup:
+        with patch.object(server, "_caller_principal") as lookup:
             assert server._tool_denied_reason("memory_forget") is None
             _dispatch("memory_forget")
         lookup.assert_not_called()

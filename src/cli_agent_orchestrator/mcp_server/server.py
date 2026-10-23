@@ -1581,6 +1581,27 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
 DISCOVERY_GATED_TOOLS = DISCOVERY_TOOLS
 
 
+def _caller_principal(claimed: str) -> Dict[str, Any]:
+    """The ``GET /me/principal`` body for this process, or raise.
+
+    ``claimed`` is this process's ``CAO_TERMINAL_ID``. The request carries the
+    per-terminal ``CAO_TERMINAL_TOKEN`` (via ``mcp_utils._auth_headers`` ->
+    ``agent_credential``), and the API decides whether the bearer proves the
+    claim -- refusing with 403 under ``CAO_PRINCIPAL_ENFORCE``, auditing and
+    falling back to the claimed terminal in warn mode.
+
+    Every failure propagates. The caller turns an unresolved identity into a
+    refusal (``tool_gate.unresolved``); reporting a 401, a 403 or an
+    unreachable server as "no identity" is how the gate came to authorize the
+    wrong row in the first place.
+    """
+
+    body = mcp_utils.get_json("/me/principal", timeout=_mcp_timeout(), claimed_terminal_id=claimed)
+    if not isinstance(body, dict):
+        raise ValueError(f"/me/principal returned {type(body).__name__}, not an object")
+    return body
+
+
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal may not call ``tool_name``, or None to proceed.
 
@@ -1604,14 +1625,20 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     which also passes on the ``discovery`` grant alone because that grant is
     documented as independent of ``@cao-mcp-server``.
 
-    Identity. The effective list is the terminal's recorded ``allowed_tools``,
-    or the profile resolution that ``None`` stands for, exactly as
-    ``create_terminal`` computes it. An unset ``CAO_TERMINAL_ID`` is the
+    Identity. The subject is the BEARER, fetched from ``GET /me/principal``
+    with this process's ``CAO_TERMINAL_ID`` passed as the *claim*. It is not
+    the row that id names: ``GET /terminals/{id}`` admits any read-scoped
+    bearer and never bound the path id to it, so fetching the claimed row and
+    authorizing from it let a process holding terminal A's credential act with
+    terminal B's allowlist. The API makes the binding decision
+    (``identity:prove``) and serves one serialized principal built by the one
+    constructor, so the effective allowlist and the delegation ceiling are the
+    same values an HTTP route would use. An unset ``CAO_TERMINAL_ID`` is the
     supported operator context (``cao assign`` / ``cao handoff`` run with no
     caller identity) and is never looked up. Once the caller claims an identity
     every failure to resolve it is an unknown, and an unknown does not dispatch:
     a malformed ID, an unreachable or unauthorized cao-server, a terminal that
-    is not registered, an unreadable profile.
+    is not registered, an unreadable profile, a bearer that proves nothing.
 
     Enforcement. Every denial on this server is hard, whatever
     ``CAO_PRINCIPAL_ENFORCE`` says: #972 shipped the whole-surface gate on main
@@ -1619,13 +1646,17 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     decision is still audited to ``CAO_HOME_DIR/logs/authz.jsonl`` by ``check``.
 
     Ephemeral policy (``max_depth``, ``child_may_delegate``) is not an allowlist
-    rule and is applied here before the allowlist, unchanged.
+    rule and is applied before the allowlist, with its effect unchanged. It now
+    goes through ``check`` under its own rule names
+    (``ephemeral:max-depth`` / ``ephemeral:child-delegation``) so a refusal that
+    used to leave no trace appears in the audit log like every other decision.
     """
-    if not tool_gate.bound_terminal_id():
+    claimed = tool_gate.bound_terminal_id()
+    if not claimed:
         return None
 
     try:
-        context = _get_terminal_context_from_env()
+        body = _caller_principal(claimed)
     except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
         logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
         return tool_gate.unresolved(
@@ -1634,55 +1665,23 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             server=CAO_MCP_SERVER,
         )
 
-    if context is None:
-        return tool_gate.unresolved(
-            tool_name,
-            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
-            "terminal could not be resolved",
-            server=CAO_MCP_SERVER,
-        )
-
-    if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
-        return "max_depth_exceeded: ephemeral agents cannot create ephemeral agents (ephemeral.max_depth=1)"
-
-    if tool_name in {
-        "assign",
-        "handoff",
-        "assign_elastic",
-        "workflow_run",
-        "workflow_resume",
-        "workflow_start",
-    }:
-        try:
-            from cli_agent_orchestrator.services.settings_service import child_may_delegate
-
-            if context.get("ephemeral") and not child_may_delegate():
-                return f"'{tool_name}' is not permitted: ephemeral child delegation requires ephemeral.child_may_delegate"
-        except Exception as exc:
-            return f"cannot authorize '{tool_name}': ephemeral delegation policy could not be resolved ({exc})"
-
     try:
-        allowed = _caller_effective_allowed_tools(context)
-    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
-        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
+        principal = tool_gate.principal_for(body)
+    except (ValueError, TypeError) as e:
+        logger.warning(f"principal payload rejected for '{tool_name}': {e}")
         return tool_gate.unresolved(
             tool_name,
-            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
-            f"be resolved ({e})",
+            f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})",
             server=CAO_MCP_SERVER,
         )
 
-    if allowed is None:
-        return tool_gate.unresolved(
-            tool_name,
-            f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved",
-            server=CAO_MCP_SERVER,
-        )
+    ephemeral_denial = tool_gate.ephemeral_denial(principal, tool_name)
+    if ephemeral_denial:
+        return ephemeral_denial
 
     # ``*`` / ``@cao-mcp-server`` / ``@cao-mcp-server/<tool>`` (tool:allowlist) and
     # the ``discovery`` carve-out for ``DISCOVERY_GATED_TOOLS`` (tool:discovery)
     # are rules in ``security.authz.authorize``, not comparisons written here.
-    principal = tool_gate.principal_for(context, allowed)
     return tool_gate.denial_for(principal, tool_name, server=CAO_MCP_SERVER)
 
 
