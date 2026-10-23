@@ -172,6 +172,14 @@ class TerminalModel(Base):
     # plaintext is never stored; a database read cannot yield a usable bearer.
     # NULL for rows minted before the principal landed or created without one.
     credential_digest = Column(String, nullable=True)
+    # JSON-encoded list: the widest ``allowed_tools`` this terminal may hand to
+    # a terminal IT creates (#948's delegation ceiling). Written at create as
+    # the intersection of what was asked for and the CREATOR's own ceiling, so
+    # it can only narrow down a delegation chain. NULL means "no ceiling
+    # recorded", which ``authz.ceiling_of`` reads as "own allowlist" -- the
+    # operator-created case and every pre-migration row. ``[]`` is an explicit
+    # "may delegate nothing" and must round-trip as ``[]``, not NULL.
+    delegate_tools = Column(String, nullable=True)
     # Provider-specific launch variant whose semantics must survive cao-server
     # restarts.  Kept generic so providers other than Kimi can use the same
     # lifecycle seam without overloading Kiro's ``engine`` or user-owned
@@ -2048,6 +2056,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN credential_digest TEXT")
             conn.commit()
             logger.info("Migration: added credential_digest column to terminals table")
+        if "delegate_tools" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added delegate_tools column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -2077,8 +2089,15 @@ def create_terminal(
     initial_delivery: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
     credential_digest: Optional[str] = None,
+    delegate_tools: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``delegate_tools`` (#948, #965) is this terminal's delegation ceiling: the
+    widest ``allowed_tools`` it may hand to a terminal it creates. The caller
+    (``terminal_service.child_delegate_tools``) has already intersected it with
+    the CREATOR's ceiling, so a chain can only narrow. ``None`` records no
+    ceiling, which ``authz.ceiling_of`` reads as "own allowlist".
 
     ``credential_digest`` (#965) is the SHA-256 of the terminal's minted
     credential, written in the same INSERT as the row so there is never a
@@ -2141,6 +2160,11 @@ def create_terminal(
             session_incarnation_id=session_incarnation_id,
             initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
             credential_digest=credential_digest,
+            # Same ``is not None`` test as ``allowed_tools`` above and for the
+            # same reason: ``[]`` is an explicit "may delegate nothing", and a
+            # falsiness test would store it as NULL, which every reader treats
+            # as "no ceiling recorded" -- i.e. unbounded by this row.
+            delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
         )
         db.add(terminal)
         if idempotency_key:

@@ -67,7 +67,13 @@ class Principal:
     agent_profile: Optional[str] = None
     role: Optional[str] = None
     allowed_tools: tuple[str, ...] = ()
-    delegate_tools: tuple[str, ...] = ()
+    #: The delegation ceiling (#948). ``None`` means NO ceiling was recorded,
+    #: which :func:`security.authz.ceiling_of` reads as "own allowlist"; ``()``
+    #: means an explicit "may delegate nothing". The two must stay
+    #: distinguishable: collapsing them makes a row that may delegate nothing
+    #: fall back to its own -- possibly ``*`` -- allowlist, which is the
+    #: escalation the ceiling exists to stop.
+    delegate_tools: Optional[tuple[str, ...]] = None
     creator_id: Optional[str] = None
     ancestors: tuple[str, ...] = ()
     run_id: Optional[str] = None
@@ -128,6 +134,18 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
     if isinstance(value, (list, tuple)):
         return tuple(str(v) for v in value)
     return ()
+
+
+def _as_tuple_or_none(value: Any) -> Optional[tuple[str, ...]]:
+    """:func:`_as_tuple`, but a NULL column stays ``None`` rather than ``()``.
+
+    For ``delegate_tools``, where "not recorded" and "recorded as empty" mean
+    opposite things.
+    """
+
+    if value is None:
+        return None
+    return _as_tuple(value)
 
 
 def _caller_of(terminal_id: str) -> Optional[str]:
@@ -255,7 +273,7 @@ def principal_from_terminal_row(row: Any) -> Principal:
         agent_profile=getattr(row, "agent_profile", None),
         role=getattr(row, "role", None),
         allowed_tools=allowed,
-        delegate_tools=_as_tuple(getattr(row, "delegate_tools", None)),
+        delegate_tools=_as_tuple_or_none(getattr(row, "delegate_tools", None)),
         creator_id=creator,
         ancestors=_ancestry(terminal_id, creator),
         ephemeral=_is_ephemeral(terminal_id),
@@ -326,7 +344,7 @@ def principal_from_payload(payload: Mapping[str, Any]) -> Principal:
         agent_profile=payload.get("agent_profile"),
         role=payload.get("role"),
         allowed_tools=_as_tuple(payload.get("allowed_tools")),
-        delegate_tools=_as_tuple(payload.get("delegate_tools")),
+        delegate_tools=_as_tuple_or_none(payload.get("delegate_tools")),
         creator_id=payload.get("creator_id"),
         ancestors=_as_tuple(payload.get("ancestors")),
         run_id=payload.get("run_id"),

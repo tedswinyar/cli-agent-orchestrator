@@ -205,9 +205,54 @@ def _entry_within_ceiling(entry: str, ceiling: Iterable[str]) -> bool:
 
 
 def ceiling_of(principal: Principal) -> tuple[str, ...]:
-    """The allowlist a principal may hand to a child: ``delegate_tools`` else its own."""
+    """The allowlist a principal may hand to a child: ``delegate_tools`` else its own.
 
-    return principal.delegate_tools or principal.allowed_tools
+    The fallback is why :func:`narrow_to_ceiling` has to run at create time. A
+    row with no recorded ceiling is bounded only by its OWN allowlist, so a
+    creator's intent to cap its delegates reaches exactly one level and then
+    evaporates: give the child a wider allowlist for any legitimate reason and
+    the grandchild inherits the child's list, not the grandparent's cap. The
+    fallback is kept (an operator-created row has no ceiling and is unbounded
+    exactly as before); what changed is that every CAO-created child now HAS a
+    recorded ceiling, so the fallback stops being the normal case.
+
+    The test is ``is None``, not falsiness, and the difference is load-bearing:
+    ``()`` is an explicit "may delegate nothing" and must NOT fall back to the
+    row's own -- possibly ``*`` -- allowlist. Collapsing the two is the same
+    escalation one level further in.
+    """
+
+    if principal.delegate_tools is None:
+        return principal.allowed_tools
+    return principal.delegate_tools
+
+
+def narrow_to_ceiling(
+    requested: Optional[Iterable[str]], ceiling: Iterable[str]
+) -> tuple[str, ...]:
+    """The ceiling to record on a child: ``requested`` clipped to ``ceiling``.
+
+    ``requested is None`` means no explicit ceiling was asked for -- the only
+    case there is today, since no client parameter carries one -- and it
+    inherits the creator's ceiling unchanged. That is the whole fix: the
+    default used to be "nothing recorded", which ``ceiling_of`` reads as the
+    child's own allowlist and is therefore an escalation whenever the child's
+    allowlist is wider than the creator's ceiling.
+
+    A requested ceiling is INTERSECTED, never trusted: entry by entry through
+    the same :func:`_entry_within_ceiling` comparator ``TERMINAL_CREATE`` uses,
+    so "within the ceiling" means one thing. Order and duplicates follow the
+    request, which keeps the recorded value readable next to what was asked for.
+    """
+
+    ceiling_tuple = tuple(str(c) for c in ceiling)
+    if requested is None:
+        return ceiling_tuple
+    return tuple(
+        entry
+        for entry in (str(r) for r in requested)
+        if _entry_within_ceiling(entry, ceiling_tuple)
+    )
 
 
 # --- the decision -----------------------------------------------------------

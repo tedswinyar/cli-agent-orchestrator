@@ -363,13 +363,18 @@ class TestRunStep:
 _UNGUARDED = "cli_agent_orchestrator.services.terminal_service._create_terminal_unguarded"
 
 
-def _terminal_principal(allowed=("fs_read",), delegate=()):
+def _terminal_principal(allowed=("fs_read",), delegate=None):
+    """``delegate=None`` is "no ceiling recorded", which falls back to ``allowed``.
+
+    NOT ``()``: an empty recorded ceiling is an explicit "may delegate nothing"
+    and does not fall back (``authz.ceiling_of``).
+    """
     return Principal(
         kind="terminal",
         scopes=frozenset({"cao:read", "cao:write"}),
         terminal_id=TERMINAL_A,
         allowed_tools=tuple(allowed),
-        delegate_tools=tuple(delegate),
+        delegate_tools=None if delegate is None else tuple(delegate),
     )
 
 

@@ -34,13 +34,15 @@ from cli_agent_orchestrator.security.principal import Principal
 RW = frozenset({"cao:read", "cao:write"})
 
 
-def term(tid="t1", allowed=(), delegate=(), ancestors=(), ephemeral=False, resolved=True):
+def term(tid="t1", allowed=(), delegate=None, ancestors=(), ephemeral=False, resolved=True):
     return Principal(
         kind="terminal",
         scopes=RW,
         terminal_id=tid,
         allowed_tools=tuple(allowed),
-        delegate_tools=tuple(delegate),
+        # ``None`` (no ceiling recorded) is NOT ``()`` (may delegate nothing):
+        # ``ceiling_of`` falls back to the own allowlist only for the first.
+        delegate_tools=None if delegate is None else tuple(delegate),
         ancestors=tuple(ancestors),
         ephemeral=ephemeral,
         allowlist_resolved=resolved,
@@ -216,8 +218,13 @@ class TestTerminalCreate:
         assert not authorize(p, TERMINAL_CREATE, ("execute_bash",)).allowed
 
     def test_ceiling_of(self):
-        assert authz.ceiling_of(term(allowed=("a",), delegate=())) == ("a",)
+        assert authz.ceiling_of(term(allowed=("a",), delegate=None)) == ("a",)
         assert authz.ceiling_of(term(allowed=("a",), delegate=("b",))) == ("b",)
+
+    def test_ceiling_of_does_not_fall_back_for_an_explicit_empty_ceiling(self):
+        """``()`` means "may delegate nothing"; falling back to ``("a",)`` would widen it."""
+        assert authz.ceiling_of(term(allowed=("a",), delegate=())) == ()
+        assert not authorize(term(allowed=("a",), delegate=()), TERMINAL_CREATE, ("a",)).allowed
 
 
 class TestActAs:

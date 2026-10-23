@@ -211,7 +211,7 @@ class TestFromTerminalRow:
         assert p.session_name == "cao-sess"
         assert p.agent_profile == "developer"
         assert p.allowed_tools == ("fs_read", "@cao-mcp-server")
-        assert p.delegate_tools == ()
+        assert p.delegate_tools is None  # no ceiling recorded != "may delegate nothing"
         assert p.creator_id is None
         assert p.ancestors == ()
         assert p.scopes == frozenset({auth.SCOPE_READ, auth.SCOPE_WRITE})

@@ -107,7 +107,12 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
 )
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.security.agent_credential import TERMINAL_TOKEN_ENV
-from cli_agent_orchestrator.security.authz import TERMINAL_CREATE, check
+from cli_agent_orchestrator.security.authz import (
+    TERMINAL_CREATE,
+    ceiling_of,
+    check,
+    narrow_to_ceiling,
+)
 from cli_agent_orchestrator.security.principal import Principal, mint_terminal_credential
 from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -1032,6 +1037,31 @@ class _EphemeralLaunchState:
     bound_terminal_id: Optional[str] = None
 
 
+def child_delegate_tools(
+    creator: Optional[Principal], requested: Optional[list[str]] = None
+) -> Optional[tuple[str, ...]]:
+    """The delegation ceiling to record on a terminal this ``creator`` creates.
+
+    ``None`` -- record no ceiling -- for an operator principal, the default-off
+    anonymous caller, and an in-process caller (``creator is None``: sidecars,
+    workflow steps, tests). Those are unbounded today and stay unbounded, and a
+    row with no ceiling keeps ``authz.ceiling_of``'s "own allowlist" meaning.
+
+    For an AGENT creator the child's ceiling is
+    ``authz.narrow_to_ceiling(requested, ceiling_of(creator))``: the creator's
+    own ceiling when nothing was asked for (the only case today -- no client
+    parameter carries one), and the intersection when something was. Never
+    wider than the creator's, which is the whole point: without a recorded
+    ceiling the child's ceiling defaults to the CHILD's allowlist, so a cap
+    reaches one level and then evaporates the moment a child has a wider
+    allowlist than its creator's cap.
+    """
+
+    if creator is None or creator.is_operator:
+        return None
+    return narrow_to_ceiling(requested, ceiling_of(creator))
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1338,6 +1368,7 @@ async def create_terminal(
             description=description,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            delegate_tools=child_delegate_tools(principal),
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -1372,10 +1403,17 @@ async def _create_terminal_unguarded(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    delegate_tools: Optional[tuple[str, ...]] = None,
     *,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
-    """Create body; the caller compensates an unbound claim or a cancelled bind."""
+    """Create body; the caller compensates an unbound claim or a cancelled bind.
+
+    ``delegate_tools`` is the already-narrowed child ceiling from
+    ``child_delegate_tools``; it travels in the row INSERT so no committed row
+    exists whose ceiling is briefly absent (and therefore briefly its own,
+    wider allowlist).
+    """
     # Idempotency resolution runs BEFORE the terminal cap check below, and the
     # order is deliberate: a key HIT returns an already-existing terminal and
     # allocates nothing, so charging it against the cap would 429 a legitimate
@@ -1890,6 +1928,9 @@ async def _create_terminal_unguarded(
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
                         credential_digest=credential_digest,
+                        delegate_tools=(
+                            list(delegate_tools) if delegate_tools is not None else None
+                        ),
                         # The initial message is ACCEPTED the moment this row is
                         # visible, so its outcome starts life as pending in the same
                         # transaction (#566): a restart between here and the deferred
