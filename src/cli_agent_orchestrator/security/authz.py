@@ -109,16 +109,22 @@ class RunRef:
 
 @dataclass(frozen=True)
 class TerminalRef:
-    """A terminal named as the TARGET of a request, with its creator chain.
+    """A terminal named as the TARGET of a request, with the facts the rule needs.
 
-    ``ancestor_terminal_ids`` is the target's ``caller_id`` chain (creator,
+    ``ancestor_terminal_ids`` is the TARGET's ``caller_id`` chain (creator,
     creator's creator, ... root) as ``principal._ancestry`` computes it, so
     "a descendant the caller created" is a membership test rather than a
-    downward walk.
+    downward walk. The caller's own chain is already on its principal.
+
+    ``peer_terminal_ids`` is the CALLER's sibling set at the widest scope
+    ``list_siblings`` serves, and is populated only for reads (see the
+    ``terminal:discovery-peer`` rule). Carried on the ref rather than looked up
+    in the rule so :func:`authorize` stays pure.
     """
 
     terminal_id: str
     ancestor_terminal_ids: tuple[str, ...] = ()
+    peer_terminal_ids: tuple[str, ...] = ()
 
 
 # --- selector coverage ------------------------------------------------------
@@ -304,18 +310,36 @@ def authorize(principal: Principal, action: str, resource: Any, **ctx: Any) -> D
         if not isinstance(resource, TerminalRef):
             return Decision(False, "terminal:bad-resource", f"{action} requires a TerminalRef")
         tid = principal.terminal_id
-        if tid and tid == resource.terminal_id:
+        target = resource.terminal_id
+        if tid and tid == target:
             return Decision(True, "terminal:self", f"{who} acts on itself")
         if tid and tid in resource.ancestor_terminal_ids:
             return Decision(
                 True,
                 "terminal:descendant",
-                f"{who} created terminal {resource.terminal_id} (directly or transitively)",
+                f"{who} created terminal {target} (directly or transitively)",
             )
+        # The two READ-ONLY widenings. Both exist because CAO's own documented
+        # flows read a record the caller does not own, and refusing those reads
+        # would break the callback protocol to enforce a rule about *acting*:
+        # ``_target_binding_denial(allow_parent=True)`` reads the supervisor's
+        # record for ``send_message`` with no receiver, and
+        # ``allow_discovered_sibling=True`` reads a peer's for the #432 flow
+        # ("find siblings with list_siblings, then message them"). Reading up or
+        # sideways is not steering up or sideways, which stays refused.
+        if ctx.get("read"):
+            if target in principal.ancestors:
+                return Decision(True, "terminal:ancestor", f"{who} may read its ancestor {target}")
+            if target in resource.peer_terminal_ids and discovery_granted(principal.allowed_tools):
+                return Decision(
+                    True,
+                    "terminal:discovery-peer",
+                    f"{who} holds the discovery grant and {target} is one of its peers",
+                )
         return Decision(
             False,
             "terminal:not-owner",
-            f"{who} neither is nor created terminal {resource.terminal_id}",
+            f"{who} neither is nor created terminal {target}",
         )
 
     if action == EPHEMERAL_DEPTH:

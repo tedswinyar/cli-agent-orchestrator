@@ -165,7 +165,71 @@ _HTTP_READ_EXEMPT_ROW = {
 
 
 # --------------------------------------------------------------------------- #
-# Row 3 — WebSocket routes.
+# Row 3 — object-addressed /terminals/{terminal_id} routes.
+#
+# Mechanism: ``api.main.bind_terminal_path_id`` (steering) or
+# ``bind_terminal_path_id_read`` (reads), the #965 dependency that binds the path
+# terminal id to the bearer.
+#
+# This row exists because the scope rows above pass for a route that is wide
+# open on its OBJECT. A terminal credential carries ``cao:read`` + ``cao:write``,
+# so ``require_any_scope(WRITE, ADMIN)`` admits every agent on the node to
+# ``POST /terminals/{any}/input`` -- the scope tier answers "may this caller use
+# this kind of route" and nothing about which terminal. Enumerating the family
+# is the point: a route added under ``/terminals/{terminal_id}`` tomorrow fails
+# this row until its author says which tier it is on, instead of shipping with
+# the path id unbound.
+# --------------------------------------------------------------------------- #
+_TERMINAL_PATH_PREFIX = "/terminals/{terminal_id}"
+
+
+def _terminal_path_registrations() -> Dict[str, bool]:
+    """``{"<METHOD> <path>": carries a binding dependency?}``.
+
+    Read off the resolved dependant tree rather than the source, so a binding
+    reached through a sub-dependency still counts and a same-named local
+    function in some other module does not.
+    """
+    from cli_agent_orchestrator.api.main import bind_terminal_path_id, bind_terminal_path_id_read
+
+    binders = {bind_terminal_path_id, bind_terminal_path_id_read}
+
+    def _calls_binder(dependant) -> bool:
+        if getattr(dependant, "call", None) in binders:
+            return True
+        return any(_calls_binder(d) for d in getattr(dependant, "dependencies", []))
+
+    out: Dict[str, bool] = {}
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if not path.startswith(_TERMINAL_PATH_PREFIX):
+            continue
+        dependant = getattr(route, "dependant", None)
+        covered = dependant is not None and _calls_binder(dependant)
+        if isinstance(route, WebSocketRoute):
+            out[f"WS {path}"] = covered
+            continue
+        for method in sorted(getattr(route, "methods", None) or set()):
+            out[f"{method} {path}"] = covered
+    return out
+
+
+_TERMINAL_PATH_EXEMPT: Dict[str, str] = {
+    # A WebSocket handshake cannot carry a dependency that returns 403: it has
+    # to be refused before ``accept()``, so the binding would have to live in
+    # the handler body next to the existing 4401 close (row 4 covers that the
+    # auth check is there). Binding it is a separate change with its own close
+    # code, and it is listed here so the omission is a recorded decision rather
+    # than an oversight.
+    f"WS {_TERMINAL_PATH_PREFIX}/ws": (
+        "WebSocket: policy must run before accept(), so the binding belongs in the "
+        "handler body with its own close code, not in a 403-raising dependency"
+    ),
+}
+
+
+# --------------------------------------------------------------------------- #
+# Row 4 — WebSocket routes.
 #
 # A WS endpoint cannot carry a FastAPI dependency that returns 403: the handshake
 # has to be refused before ``accept()``, so the policy lives in the handler body.
@@ -193,7 +257,7 @@ def _ws_registrations() -> Dict[str, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Row 4 — CAO MCP tools (``@cao-mcp-server``).
+# Row 5 — CAO MCP tools (``@cao-mcp-server``).
 #
 # Mechanism: ``mcp_server/server.py::_tool_denied_reason``, the #671 guard. It
 # enforces the caller terminal's effective ``allowed_tools`` against the
@@ -297,7 +361,7 @@ def _cao_mcp_registrations() -> Dict[str, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Row 5 — ops MCP tools (``cao-ops-mcp-server``).
+# Row 6 — ops MCP tools (``cao-ops-mcp-server``).
 #
 # Until #965 WS3 nothing in ``ops_mcp_server/`` consulted any caller policy (the
 # live defect #1005 recorded): ``launch_session`` forwarded caller-supplied
@@ -317,7 +381,7 @@ def _ops_mcp_registrations() -> Dict[str, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Row 6 — plugin-registered MCP tools (the ``on_mcp_server`` hook).
+# Row 7 — plugin-registered MCP tools (the ``on_mcp_server`` hook).
 #
 # ``PluginRegistry.register_mcp_server_surfaces`` hands any installed
 # ``cao.plugins`` entry point the live FastMCP server and lets it register tools.
@@ -365,7 +429,7 @@ def _plugin_mcp_registrations() -> Dict[str, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Row 7 — plugin event hooks.
+# Row 8 — plugin event hooks.
 #
 # Dispatch is keyed on ``event_type`` strings set by the ``@hook`` decorator and
 # resolved at registration time with no validation, so a typo'd or invented
@@ -432,6 +496,15 @@ SURFACES: Tuple[Surface, ...] = (
         exempt_may_be_covered=True,
     ),
     Surface(
+        name="terminal-path-routes",
+        mechanism=(
+            "a Depends(bind_terminal_path_id) (steering) or "
+            "Depends(bind_terminal_path_id_read) (reads) dependency on the route"
+        ),
+        registrations=_terminal_path_registrations,
+        exempt=_TERMINAL_PATH_EXEMPT,
+    ),
+    Surface(
         name="websocket-routes",
         mechanism="an is_auth_enabled() scope check and a 4401 close present in the handler body",
         registrations=_ws_registrations,
@@ -470,6 +543,7 @@ EXPECTED_SURFACES = frozenset(
     {
         "http-mutating-routes",
         "http-read-routes",
+        "terminal-path-routes",
         "websocket-routes",
         "cao-mcp-tools",
         "ops-mcp-tools",
@@ -632,6 +706,46 @@ def test_the_covered_or_exempt_assertion_passes_once_the_registration_is_exempte
         exempt={"forgotten": "scratch reason"},
     )
     test_every_registration_is_policy_covered_or_exempt(row)
+
+
+def test_the_terminal_path_probe_sees_an_unbound_route():
+    """A route registered under the family with no binding dependency reads as uncovered.
+
+    Registers one on a scratch app with the real path prefix and runs the real
+    probe body against it, so this covers the probe that ships rather than a
+    re-implementation of it.
+    """
+    from fastapi import FastAPI
+
+    scratch = FastAPI()
+
+    @scratch.post(_TERMINAL_PATH_PREFIX + "/scratch")
+    async def scratch_unbound(terminal_id: str) -> dict:  # pragma: no cover - never called
+        return {"ok": True}
+
+    with patch("test.security.test_registration_policy_coverage.app", scratch, create=False):
+        registrations = _terminal_path_registrations()
+    assert registrations == {f"POST {_TERMINAL_PATH_PREFIX}/scratch": False}
+
+
+def test_the_terminal_path_probe_sees_a_bound_route():
+    """...and is not vacuously False: it does detect the real dependency."""
+    from fastapi import Depends as FDepends
+    from fastapi import FastAPI
+
+    from cli_agent_orchestrator.api.main import bind_terminal_path_id
+
+    scratch = FastAPI()
+
+    @scratch.post(_TERMINAL_PATH_PREFIX + "/scratch")
+    async def scratch_bound(  # pragma: no cover - never called
+        terminal_id: str, _bound=FDepends(bind_terminal_path_id)
+    ) -> dict:
+        return {"ok": True}
+
+    with patch("test.security.test_registration_policy_coverage.app", scratch, create=False):
+        registrations = _terminal_path_registrations()
+    assert registrations == {f"POST {_TERMINAL_PATH_PREFIX}/scratch": True}
 
 
 def test_an_unguarded_scratch_http_route_reads_as_uncovered():

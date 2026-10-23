@@ -139,7 +139,9 @@ from cli_agent_orchestrator.security.authz import (
     RUN_REPLAY,
     RUN_RESUME,
     TERMINAL_ACT_AS,
+    TERMINAL_TARGET,
     RunRef,
+    TerminalRef,
     check,
     enforcing,
 )
@@ -2629,6 +2631,95 @@ async def get_my_principal(
     }
 
 
+def _terminal_ref(terminal_id: str, principal: Principal, *, read: bool) -> TerminalRef:
+    """A :class:`TerminalRef` for ``terminal_id`` with the facts the rule needs.
+
+    The target's creator chain always; the CALLER's sibling set only for a read,
+    because only the read tier has a ``terminal:discovery-peer`` rule and
+    ``list_siblings`` is a group-prefix query nothing else needs to pay for.
+    The scope is the widest ``list_siblings`` serves -- the caller's full own
+    group, ``cross_session=True`` -- which is exactly what
+    ``utils.orchestration._target_binding_denial`` asks for when it checks a
+    discovered sibling, so the two cannot disagree about who is a peer.
+    """
+    from cli_agent_orchestrator.security.principal import _ancestry, _caller_of
+
+    creator = _caller_of(terminal_id)
+    peers: tuple[str, ...] = ()
+    if read and principal.terminal_id:
+        try:
+            peers = tuple(
+                str(s["id"])
+                for s in terminal_service.list_siblings(principal.terminal_id, cross_session=True)
+                if s.get("id")
+            )
+        except Exception:  # noqa: BLE001  (no peers is the closed answer)
+            logger.debug("sibling lookup failed for %s", principal.terminal_id, exc_info=True)
+    return TerminalRef(
+        terminal_id=terminal_id,
+        ancestor_terminal_ids=_ancestry(terminal_id, creator),
+        peer_terminal_ids=peers,
+    )
+
+
+async def _bind_terminal_path_id(terminal_id: str, principal: Principal, *, read: bool) -> None:
+    if principal.is_operator:
+        return
+    ref = await asyncio.to_thread(_terminal_ref, terminal_id, principal, read=read)
+    check(principal, TERMINAL_TARGET, ref, hard=enforcing(), read=read)
+
+
+async def bind_terminal_path_id(
+    terminal_id: str,
+    principal: Principal = Depends(get_current_principal),
+) -> Principal:
+    """Bind a STEERING ``/terminals/{terminal_id}`` route to the bearer (#965).
+
+    Every route under ``/terminals/{terminal_id}`` was scope-gated and nothing
+    more, and a terminal credential carries ``cao:read`` + ``cao:write``, so any
+    agent on the node could type into, key, exit or delete ANY terminal --
+    including its own supervisor's. The scope tier answers "may this caller use
+    this kind of route"; it cannot answer "on this object", which is the only
+    question an object-addressed route asks.
+
+    For an agent (``terminal`` / ``run``) principal the target must be the
+    caller's own terminal or one it created, directly or transitively. Anything
+    else is ``terminal:not-owner``: 403 under ``CAO_PRINCIPAL_ENFORCE``,
+    audited and allowed through in warn mode. Operator and the default-off
+    anonymous caller are unbounded exactly as today, so an operator-driven UI,
+    CLI or script sees no change.
+
+    Declared as a dependency rather than written into each handler so the
+    structural guard in ``test/security/test_registration_policy_coverage.py``
+    (row ``terminal-path-routes``) can enumerate the registration table and
+    fail on a route that carries neither this nor
+    :func:`bind_terminal_path_id_read` -- a route added tomorrow is bound by
+    default rather than open by default.
+    """
+    await _bind_terminal_path_id(terminal_id, principal, read=False)
+    return principal
+
+
+async def bind_terminal_path_id_read(
+    terminal_id: str,
+    principal: Principal = Depends(get_current_principal),
+) -> Principal:
+    """Bind a READ ``/terminals/{terminal_id}`` route to the bearer (#965).
+
+    :func:`bind_terminal_path_id`'s rule, widened with the two relationships
+    CAO's own documented flows read across:
+    ``terminal:ancestor`` (``_target_binding_denial(allow_parent=True)`` reads
+    the supervisor's record so a worker can ``send_message`` upward) and
+    ``terminal:discovery-peer`` (``allow_discovered_sibling=True`` reads a
+    peer's for issue #432's "find siblings with ``list_siblings``, then message
+    them with ``send_message``"). Refusing those reads would break the callback
+    protocol in order to enforce a rule about *acting*; reading up or sideways
+    is not steering up or sideways, and that stays refused.
+    """
+    await _bind_terminal_path_id(terminal_id, principal, read=True)
+    return principal
+
+
 def _require_ephemeral_enabled(request: Request) -> Dict[str, Any]:
     """Gate the opt-in surface before reading an untrusted body."""
     from cli_agent_orchestrator.services import ephemeral_service
@@ -4165,6 +4256,7 @@ async def list_terminals_in_session(
 async def get_terminal(
     terminal_id: TerminalId,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ) -> Terminal:
     try:
         # get_terminal reads status_monitor.get_status(), which for a
@@ -4190,6 +4282,7 @@ async def update_terminal_group_endpoint(
     terminal_id: TerminalId,
     body: UpdateGroupBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Terminal:
     """Replace a terminal's group array (#432).
 
@@ -4222,6 +4315,7 @@ async def update_terminal_description_endpoint(
     terminal_id: TerminalId,
     body: UpdateDescriptionBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Terminal:
     try:
         updated = await asyncio.to_thread(
@@ -4239,6 +4333,7 @@ async def update_terminal_metadata_endpoint(
     terminal_id: TerminalId,
     body: UpdateMetadataBody,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Terminal:
     """Replace a terminal's free-form metadata dict (#432).
 
@@ -4293,6 +4388,7 @@ async def list_terminal_siblings(
         ),
     ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ) -> List[Dict]:
     """List sibling terminals sharing a leading prefix of this terminal's own group (#432).
 
@@ -4340,6 +4436,7 @@ async def list_terminal_siblings(
 async def get_terminal_memory_context(
     terminal_id: TerminalId,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ):
     """Return the CAO memory context block for a terminal as plain text.
 
@@ -4367,6 +4464,7 @@ async def get_terminal_memory_context(
 async def get_terminal_working_directory(
     terminal_id: TerminalId,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
@@ -4389,6 +4487,7 @@ async def send_terminal_input(
     sender_id: Optional[str] = None,
     orchestration_type: Optional[OrchestrationType] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Dict:
     try:
         # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
@@ -4420,6 +4519,7 @@ async def send_terminal_key(
     terminal_id: TerminalId,
     key: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Dict:
     """Send a tmux special key to a terminal."""
     if not TMUX_KEY_PATTERN.fullmatch(key):
@@ -4449,6 +4549,7 @@ async def get_terminal_output(
     terminal_id: TerminalId,
     mode: OutputMode = OutputMode.FULL,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
@@ -4482,6 +4583,7 @@ async def get_terminal_output_range(
         description=f"Bytes to read (capped at {TERMINAL_RANGE_MAX_LENGTH})",
     ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ) -> TerminalOutputRange:
     """Read an exact byte range from a terminal's on-disk log (U5 / #504, FR-4.3).
 
@@ -4521,6 +4623,7 @@ async def get_terminal_output_range(
 async def exit_terminal(
     terminal_id: TerminalId,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
@@ -8291,6 +8394,7 @@ async def delete_terminal(
     request: Request,
     terminal_id: TerminalId,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id),
 ) -> Dict:
     """Delete a terminal."""
     try:
@@ -8376,6 +8480,7 @@ async def get_inbox_messages_endpoint(
         default=None, alias="status", description="Filter by message status"
     ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    _bound: Principal = Depends(bind_terminal_path_id_read),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
