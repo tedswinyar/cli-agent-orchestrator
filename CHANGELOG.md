@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #481, now shared by both, and it additionally requires the `❯` selection cursor on one of
   the numbered choices, so a reply that quotes the question above a plain numbered list is
   not taken for the dialog. A session-name rule drawn under the dialog in a named session no
-  longer hides it.
+  longer hides it. The question is also recognised when the pane wraps it, as the
+  80-column pane of a headless launch does; before, both readers missed it there.
 
 - **herdr: inbox messages are no longer typed into an open Claude Code dialog** (#896). herdr
   can report a pane as idle or done while an AskUserQuestion, permission or plan-approval

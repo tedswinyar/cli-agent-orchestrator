@@ -201,7 +201,10 @@ WAITING_USER_ANSWER_PATTERN = (
     r"↑/↓ to navigate|Enter to confirm[ \t]*·|Esc to cancel[ \t]*·[ \t]*Tab to amend"
     r"|Enter to select[ \t]*·[ \t]*(?:Tab/Arrow keys|[Aa]rrow keys|[Aa]rrows|↑↓) to navigate"
 )
-PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
+# \s+ between the words: at CAO's default 80-column tmux pane Claude Code wraps the
+# question after "to" (claude_code_405_plan_approval_80col_2_1_330.txt), and a
+# narrower pane wraps it elsewhere.
+PLAN_APPROVAL_PATTERN = r"Would\s+you\s+like\s+to\s+proceed\?"
 # The plan-approval dialog (#405; Claude Code 2.1.209 and 2.1.330 captures in
 # test/providers/fixtures/claude_code_405_plan_approval_2_1_209.txt and
 # claude_code_896_herdr_plan_approval.txt):

@@ -4564,6 +4564,15 @@ class TestClaudeCode405PlanApproval:
       through herdr (#896).
     - ``claude_code_896_herdr_plan_approved.txt``: the same session after the plan
       was approved.
+    - ``claude_code_405_plan_approval_80col_2_1_330.txt``: Claude Code 2.1.330 in
+      the 80x22 tmux pane a headless ``cao launch`` gives. The question wraps:
+      "... Would you like to" / "proceed?". The first version of this fix missed
+      it, live: a message was typed in and its Enter approved the plan.
+    - ``claude_code_405_plan_approval_named_session_2_1_330.txt`` (200 columns)
+      and ``..._named_session_80col_2_1_330.txt``: the dialog in a named session,
+      with the session-name rule as the last row. Approving a plan names the
+      session, so every plan dialog after the first looks like this. In these
+      two the home directory in the plan text is replaced with /home/username.
 
     Frames built from those (a reply spliced above a real input box, a row
     replaced, the cursor blanked) say so in the test that builds them.
@@ -4573,6 +4582,9 @@ class TestClaudeCode405PlanApproval:
     PLAN_FRAMES = {
         "2.1.209-tmux": "claude_code_405_plan_approval_2_1_209",
         "2.1.330-herdr": "claude_code_896_herdr_plan_approval",
+        "2.1.330-tmux-named": "claude_code_405_plan_approval_named_session_2_1_330",
+        "2.1.330-tmux-80col": "claude_code_405_plan_approval_80col_2_1_330",
+        "2.1.330-tmux-80col-named": "claude_code_405_plan_approval_named_session_80col_2_1_330",
     }
     DIALOG_FIXTURES = [
         "claude_code_310_bash_permission_prompt",
@@ -4626,7 +4638,8 @@ class TestClaudeCode405PlanApproval:
         frame = cls._frame(stem)
         while not frame[-1].strip():
             frame.pop()
-        (question,) = [i for i, row in enumerate(frame) if "Would you like to proceed?" in row]
+        # "Would you like to" starts the question; an 80-column pane wraps "proceed?".
+        (question,) = [i for i, row in enumerate(frame) if "Would you like to" in row]
         return frame[question:]
 
     @classmethod
@@ -4746,8 +4759,9 @@ class TestClaudeCode405PlanApproval:
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_session_name_rule_under_the_dialog_does_not_hide_it(self, mock_backend):
-        """Composed, not captured: no plan dialog was captured in a named session.
+        """Composed: the real named-session captures are in ``PLAN_FRAMES``.
 
+        This one puts a different session's rule under the herdr-read frame.
         The 2.1.330 plan frame with the rule a named session draws as the last
         row under every dialog captured in one, taken from
         claude_code_896_herdr_named_session_single.txt. #481 read any rule after
