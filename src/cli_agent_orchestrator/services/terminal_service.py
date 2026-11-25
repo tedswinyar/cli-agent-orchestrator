@@ -376,8 +376,12 @@ def _pre_send_pane_check(
     fails the read the same way; the steps after this check still refuse or
     fail that send as they always did, so it is never reported as a dialog.
 
-    What stays open: a dialog that opens between this read and the paste, a
-    window of milliseconds. Nothing on the terminal side closes it.
+    What stays open: a dialog that opens between this read and the submitting
+    Enter. That is not just the paste: the backend waits the provider's
+    ``paste_submit_delay`` between the paste and the Enter (2 s for Claude
+    Code), and the Enter is the key that answers a dialog. It matters mostly
+    for eager delivery, where the agent is mid-turn and can open a dialog at
+    any moment. Nothing here closes it.
 
     Logging: the first hold of an episode is one INFO line, the holds that
     follow while the dialog stays open are the same line at DEBUG and come back

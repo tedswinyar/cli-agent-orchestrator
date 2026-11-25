@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way, and so is eager delivery, which sends while the status still reads processing. This
   costs one `tmux capture-pane` of the visible screen per such send, plus the tmux lookups
   that find the pane, run off the event loop; a capture that fails does not hold delivery.
-  What remains is a dialog that opens in the milliseconds between that capture and the paste.
+  What remains is a dialog that opens between that capture and the submitting Enter, which
+  includes the wait between the paste and the Enter (2 s for Claude Code).
   A provider that cannot recognise a dialog on screen is not read at all, on either backend.
 
 - **herdr: inbox messages are no longer typed into an open Claude Code dialog** (#896). herdr
