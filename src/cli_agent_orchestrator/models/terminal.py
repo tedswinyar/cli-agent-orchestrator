@@ -83,8 +83,8 @@ class TerminalInputBlockedError(Exception):
     running instead of tearing it down the way any other exception from initialize() (or from the
     send_input it triggers on the deferred-init path) would.
 
-    ``repeat_of_logged_hold`` is about logging only. The native-status pane check
-    (#896) sets it on a refusal that continues a hold it already logged, because
+    ``repeat_of_logged_hold`` is about logging only. The pre-send pane check
+    (#896, #405) sets it on a refusal that continues a hold it already logged, because
     delivery is retried for as long as the dialog stays open; a catcher that logs
     each refusal logs that one at DEBUG. Callers must not branch on it otherwise.
     """

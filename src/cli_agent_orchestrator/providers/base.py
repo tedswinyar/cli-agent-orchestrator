@@ -424,13 +424,15 @@ class BaseProvider(ABC):
         dialog that only a user may answer.
 
         The backstop behind ``blocks_orchestrated_input_while_waiting_user_answer``
-        for backends whose status is the backend's own agent state rather than a
-        screen read (#896): herdr has reported ``idle`` and ``done`` with a Claude
-        Code dialog open, so ``terminal_service`` reads the pane once before
-        typing orchestrated input and asks the provider. ``pane_text`` is the
+        for a status that is wrong about a dialog. herdr's own agent state has
+        read ``idle`` and ``done`` with a Claude Code dialog open (#896), and on
+        tmux the cached status can be older than the dialog (#405). So
+        ``terminal_service`` reads the pane once before typing orchestrated
+        input, on every backend, and asks the provider. ``pane_text`` is the
         visible screen with escapes stripped; trailing blank rows may be present.
 
-        Default False, meaning "cannot tell": the status is then trusted as before.
+        Default False, meaning "cannot tell": the status is then trusted as
+        before, and the pane is not read for a provider that inherits this.
         Override by calling the provider's existing dialog detection, not a copy.
         """
         return False

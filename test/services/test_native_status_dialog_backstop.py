@@ -1,15 +1,22 @@
-"""#896 case 2: a dialog the backend's native status did not report.
+"""A dialog the terminal's status did not report: #896 case 2 (herdr) and #405 (tmux).
 
-On the herdr backends CAO does not read the screen to decide status: the
+The pre-send pane check reads the pane once before typing orchestrated input
+and asks the provider whether a user-answer dialog is on screen
+(``BaseProvider.shows_user_answer_dialog``). It runs on every backend. The file
+keeps the name it had when the check was herdr-only.
+
+herdr (#896 case 2). On the herdr backends CAO does not read the screen to decide status: the
 provider returns herdr's own agent state. herdr has reported ``idle`` and
 ``done`` with a Claude Code dialog open (herdrdev/herdr#4573, #5741), so the
 #973 guard, which tests the status, saw a ready terminal and the inbox message
 was typed into the dialog: the paste was swallowed and the trailing Enter
 selected the highlighted option.
 
-The backstop under test reads the pane once before typing orchestrated input
-and asks the provider whether a user-answer dialog is on screen
-(``BaseProvider.shows_user_answer_dialog``).
+tmux (#405, the race). Status is the monitor's cached verdict, computed as
+terminal output is processed. A dialog that opened after the last verdict, or
+whose frame is not processed yet, reads as ready (or PROCESSING, which eager
+delivery sends on), and the message was typed into it. The ``TestTmux*``
+classes at the end cover that backend.
 
 Frames. ``claude_code_896_herdr_*`` in test/providers/fixtures are what CAO
 itself read in a live run (Claude Code 2.1.330, herdr 0.9.5): the output of
@@ -477,14 +484,6 @@ class TestDispatchRefusesIntoUnreportedDialog:
         backend.send_keys.assert_called_once()
         assert _screen_reads(backend) == []
 
-    def test_tmux_backend_is_never_read(self):
-        """Not a native-status backend: no capture at all, and nothing changes."""
-        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=None, event_inbox=False)
-        with _terminal(_claude(), backend, status=TerminalStatus.IDLE):
-            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
-        backend.send_keys.assert_called_once()
-        assert _screen_reads(backend) == []
-
     def test_provider_that_does_not_block_at_dialogs_is_never_read(self):
         provider = MagicMock()
         provider.blocks_orchestrated_input_while_waiting_user_answer = False
@@ -496,9 +495,20 @@ class TestDispatchRefusesIntoUnreportedDialog:
         backend.send_keys.assert_called_once()
         backend.get_history.assert_not_called()
 
-    def test_blocking_provider_without_the_method_is_unaffected(self):
-        """codex blocks at dialogs but inherits the default: cannot tell, so send."""
+    def test_blocking_provider_that_inherits_the_method_is_never_read(self):
+        """codex blocks at dialogs but inherits the default, which answers False
+        for every pane: reading one for it would buy nothing."""
         assert CodexProvider.shows_user_answer_dialog is BaseProvider.shows_user_answer_dialog
+        provider = CodexProvider("term-1", "cao-session", "developer-abcd")
+        assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+        backend = _backend(DIALOG_PANES[ASK_USER_QUESTION], native=TerminalStatus.IDLE)
+        with _terminal(provider, backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.send_keys.assert_called_once()
+        assert _screen_reads(backend) == []
+
+    def test_blocking_provider_whose_method_cannot_tell_is_unaffected(self):
+        """A stand-in is asked, and the default's "cannot tell" sends."""
         provider = MagicMock()
         provider.blocks_orchestrated_input_while_waiting_user_answer = True
         provider.shows_user_answer_dialog.side_effect = lambda text: (
@@ -546,7 +556,7 @@ class TestDispatchRefusesIntoUnreportedDialog:
         backend.get_history.assert_not_called()
 
 
-PANE_CHECK_LOG = "Native-status pane check held input to term-1"
+PANE_CHECK_LOG = "Pre-send pane check held input to term-1"
 
 
 class TestRefusalsCanBeToldApart:
@@ -568,7 +578,7 @@ class TestRefusalsCanBeToldApart:
         message = str(exc.value)
         assert message.startswith("Terminal term-1 is waiting for a user answer: ")
         assert "its reported status was idle, but a dialog is open on screen" in message
-        assert "(native-status pane check)" in message
+        assert "(pre-send pane check)" in message
         assert "Use answer_user_prompt" in message
         held = [r for r in caplog.records if PANE_CHECK_LOG in r.getMessage()]
         assert [r.levelname for r in held] == ["INFO"]
@@ -632,9 +642,7 @@ class TestReadOnRealHerdrBackend:
         ):
             assert backend.supports_event_inbox() is True
             assert (
-                ts._pane_shows_dialog_native_status_missed(
-                    "term-1", _claude(), OrchestrationType.SEND_MESSAGE
-                )
+                ts._pre_send_pane_check_holds("term-1", _claude(), OrchestrationType.SEND_MESSAGE)
                 is True
             )
         assert run.call_args_list == [
@@ -762,7 +770,7 @@ class TestBareEnterRecovery:
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
         assert PANE_CHECK_LOG in caplog.text
-        assert "the native-status pane check found a dialog on screen" in caplog.text
+        assert "the pre-send pane check found a dialog on screen" in caplog.text
         caplog.clear()
         with caplog.at_level("INFO"):
             self._recover(
@@ -781,21 +789,14 @@ class TestBareEnterRecovery:
             orchestration_type=OrchestrationType.SEND_MESSAGE,
         ) == ["Enter"]
 
-    def test_enter_is_still_resent_on_tmux(self):
-        assert self._recover(
-            DIALOG_PANES["bash_permission_prompt"],
-            event_inbox=False,
-            orchestration_type=OrchestrationType.SEND_MESSAGE,
-        ) == ["Enter"]
-
     def test_enter_is_still_resent_for_untyped_input(self):
         assert self._recover(
             DIALOG_PANES["bash_permission_prompt"], event_inbox=True, orchestration_type=None
         ) == ["Enter"]
 
 
-HELD = "Native-status pane check held input to "
-RELEASED = "Native-status pane check released "
+HELD = "Pre-send pane check held input to "
+RELEASED = "Pre-send pane check released "
 FAILED_TO_SEND = "Failed to send input to terminal "
 CANNOT_TAKE_INPUT = "cannot take input yet; leaving 1 message(s) pending for retry"
 UNREADABLE = "Could not read the pane of "
@@ -831,13 +832,19 @@ def _make_screen_unreadable(backend: MagicMock, unreadable: Any) -> None:
 
 
 @contextmanager
-def _inbox(backend: MagicMock) -> Iterator[Any]:
+def _inbox(
+    backend: MagicMock,
+    status: Optional[TerminalStatus] = None,
+    provider: Optional[ClaudeCodeProvider] = None,
+) -> Iterator[Any]:
     """An InboxService with one pending message for term-1, on ``backend``.
 
+    ``status`` is the monitor's canned answer, the cached status of the tmux
+    path; None derives it from the provider as on herdr (see ``_terminal``).
     Yields ``(service, update)``; ``update`` is the patched message-status write.
     """
     with ExitStack() as stack:
-        monitor = stack.enter_context(_terminal(_claude(), backend))
+        monitor = stack.enter_context(_terminal(provider or _claude(), backend, status))
         module = "cli_agent_orchestrator.services.inbox_service"
         stack.enter_context(
             patch(f"{module}.get_pending_messages", return_value=[_inbox_message()])
@@ -947,9 +954,7 @@ class TestHoldEpisodeLogging:
             assert MESSAGE in backend.send_keys.call_args.args[2]
             assert update.call_args_list == [call(1, MessageStatus.DELIVERED)]
             released = [r.getMessage() for r in caplog.records if RELEASED in r.getMessage()]
-            assert released == [
-                "Native-status pane check released term-1: no dialog on screen any more"
-            ]
+            assert released == ["Pre-send pane check released term-1: no dialog on screen any more"]
             assert _levels(caplog, RELEASED) == ["INFO"]
             for line in HOLD_LINES:
                 assert _levels(caplog, line) == [], line
@@ -1057,9 +1062,7 @@ class TestHoldEpisodeLogging:
         def check() -> None:
             start.wait(timeout=10)
             results.append(
-                ts._check_pane_for_unreported_dialog(
-                    "term-1", provider, OrchestrationType.SEND_MESSAGE
-                )
+                ts._pre_send_pane_check("term-1", provider, OrchestrationType.SEND_MESSAGE)
             )
 
         with _terminal(provider, backend), caplog.at_level("DEBUG"):
@@ -1113,3 +1116,362 @@ class TestHoldEpisodeLogging:
                 "term-1", {"tmux_session": "cao-session", "tmux_window": "developer-abcd"}
             )
         assert ts._pane_check_holding == {"term-2"}
+
+
+# --- tmux (#405, the race) ---------------------------------------------------
+
+# The dialog frames #405's regression is pinned on: three AskUserQuestion and
+# plan-approval pages, and the two permission prompts captured from tmux.
+TMUX_RACE_DIALOGS = [
+    "herdr_single_question",
+    "herdr_plan_approval",
+    "herdr_review_page",
+    "bash_permission_prompt",
+    "write_permission_prompt",
+]
+TMUX_READY_PANES = ["startup_idle", "turn_ended", "idle_after_permission", "herdr_idle"]
+SCREEN_READ = call("cao-session", "developer-abcd", strip_escapes=True, visible_only=True)
+
+
+def _tmux(pane: Any) -> MagicMock:
+    """A tmux-shaped backend double: no event inbox and no native status."""
+    return _backend(pane, native=None, event_inbox=False)
+
+
+@contextmanager
+def _tmux_inbox(
+    backend: MagicMock, cached: TerminalStatus, *, eager: bool = False
+) -> Iterator[Any]:
+    """``_inbox`` on tmux with the cached status ``cached``.
+
+    The submit confirmation is off: it waits on real output after a delivery,
+    and what is under test ends at the paste. ``eager`` turns eager delivery on
+    for an initialized provider, the only kind it sends to mid-turn.
+    """
+    module = "cli_agent_orchestrator.services.inbox_service"
+    provider = _claude()
+    provider._initialized = eager
+    with ExitStack() as stack:
+        stack.enter_context(patch(f"{module}.INBOX_SUBMIT_CONFIRMATION", False))
+        stack.enter_context(patch(f"{module}.EAGER_INBOX_DELIVERY", eager))
+        yield stack.enter_context(_inbox(backend, cached, provider))
+
+
+class TestTmuxCachedStatusRace:
+    """THE REGRESSION (#405). The cached status is ready, the screen shows a dialog."""
+
+    @pytest.mark.parametrize("cached", [TerminalStatus.IDLE, TerminalStatus.COMPLETED])
+    @pytest.mark.parametrize("name", TMUX_RACE_DIALOGS)
+    def test_inbox_message_is_held_then_delivered_once_the_dialog_is_gone(self, name, cached):
+        """Fails without the tmux pane check: the message is typed into the dialog."""
+        backend = _tmux(DIALOG_PANES[name])
+        with _tmux_inbox(backend, cached) as (service, update):
+            service.deliver_pending("term-1")
+
+            backend.send_keys.assert_not_called()
+            backend.send_special_key.assert_not_called()
+            assert update.call_args_list == [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.PENDING),
+            ]
+            assert _screen_reads(backend) == [SCREEN_READ]
+
+            # The human answers; the pane is an ordinary idle prompt again.
+            update.reset_mock()
+            backend.get_history.return_value = READY_PANES["idle_after_permission"]
+            service.deliver_pending("term-1")
+
+            backend.send_keys.assert_called_once()
+            assert MESSAGE in backend.send_keys.call_args.args[2]
+            assert update.call_args_list == [call(1, MessageStatus.DELIVERED)]
+            assert _screen_reads(backend) == [SCREEN_READ, SCREEN_READ]
+
+    @pytest.mark.parametrize("name", TMUX_RACE_DIALOGS)
+    def test_eager_delivery_is_held_while_the_cached_status_says_processing(self, name):
+        """Eager delivery sends on PROCESSING, which is what a cached status
+        still says when the dialog opened after it was computed."""
+        backend = _tmux(DIALOG_PANES[name])
+        with _tmux_inbox(backend, TerminalStatus.PROCESSING, eager=True) as (service, update):
+            service.deliver_pending("term-1")
+
+            backend.send_keys.assert_not_called()
+            assert update.call_args_list == [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.PENDING),
+            ]
+
+            update.reset_mock()
+            backend.get_history.return_value = READY_PANES["turn_ended"]
+            service.deliver_pending("term-1")
+
+            backend.send_keys.assert_called_once()
+            assert MESSAGE in backend.send_keys.call_args.args[2]
+            assert update.call_args_list == [call(1, MessageStatus.DELIVERED)]
+
+    @pytest.mark.parametrize("orchestration_type", list(OrchestrationType), ids=lambda t: t.value)
+    def test_every_orchestration_type_is_refused(self, orchestration_type):
+        backend = _tmux(DIALOG_PANES["herdr_plan_approval"])
+        with _terminal(_claude(), backend, status=TerminalStatus.IDLE):
+            _assert_refused(backend, orchestration_type=orchestration_type)
+            ts.inject_memory_context.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_refusal_names_the_cached_status_and_the_check(self):
+        backend = _tmux(DIALOG_PANES[ASK_USER_QUESTION])
+        with _terminal(_claude(), backend, status=TerminalStatus.COMPLETED):
+            message = str(_refused())
+        assert message.startswith("Terminal term-1 is waiting for a user answer: ")
+        assert "its reported status was completed, but a dialog is open on screen" in message
+        assert "(pre-send pane check)" in message
+        assert "native" not in message
+
+
+class TestTmuxCaptureCount:
+    """One capture per orchestrated dispatch that can use the answer, none otherwise."""
+
+    @pytest.mark.parametrize("name", TMUX_READY_PANES)
+    def test_ready_pane_is_delivered_after_exactly_one_capture(self, name):
+        backend = _tmux(READY_PANES[name])
+        with _terminal(_claude(), backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.send_keys.assert_called_once()
+        assert _screen_reads(backend) == [SCREEN_READ]
+
+    def test_the_answer_is_not_kept_between_dispatches(self):
+        """A kept answer would be as stale as the cached status: read every time."""
+        backend = _tmux(READY_PANES["turn_ended"])
+        with _terminal(_claude(), backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+            backend.get_history.return_value = DIALOG_PANES[ASK_USER_QUESTION]
+            _refused()
+        backend.send_keys.assert_called_once()
+        assert _screen_reads(backend) == [SCREEN_READ, SCREEN_READ]
+
+    def test_operator_input_is_not_captured_and_reaches_the_dialog(self):
+        backend = _tmux(DIALOG_PANES[ASK_USER_QUESTION])
+        with _terminal(_claude(), backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", "1")
+        backend.send_keys.assert_called_once()
+        assert _screen_reads(backend) == []
+
+    def test_provider_that_does_not_block_at_dialogs_is_not_captured(self):
+        provider = MagicMock()
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        provider.shows_user_answer_dialog.return_value = True
+        provider.paste_enter_count = 1
+        backend = _tmux(DIALOG_PANES[ASK_USER_QUESTION])
+        with _terminal(provider, backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.send_keys.assert_called_once()
+        backend.get_history.assert_not_called()
+
+    def test_blocking_provider_that_inherits_the_method_is_not_captured(self):
+        provider = CodexProvider("term-1", "cao-session", "developer-abcd")
+        backend = _tmux(DIALOG_PANES[ASK_USER_QUESTION])
+        with _terminal(provider, backend, status=TerminalStatus.IDLE):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.send_keys.assert_called_once()
+        assert _screen_reads(backend) == []
+
+    def test_status_guard_refuses_without_a_capture(self):
+        backend = _tmux(DIALOG_PANES[ASK_USER_QUESTION])
+        with _terminal(_claude(), backend, status=TerminalStatus.WAITING_USER_ANSWER):
+            _assert_refused(backend, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.get_history.assert_not_called()
+
+
+class TestTmuxFailOpen:
+    """A capture that fails does not hold delivery, and a missing pane is not a dialog."""
+
+    @pytest.mark.parametrize(
+        "pane",
+        [RuntimeError("tmux capture-pane: server exited"), "", "   \n\n", None, MagicMock()],
+        ids=["raises", "empty", "blank", "none", "not-text"],
+    )
+    def test_failed_capture_is_delivered_and_warns(self, pane, caplog):
+        backend = _tmux("")
+        _make_screen_unreadable(backend, pane)
+        with (
+            _terminal(_claude(), backend, status=TerminalStatus.IDLE),
+            caplog.at_level("WARNING"),
+        ):
+            ts.dispatch_input("term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE)
+        backend.send_keys.assert_called_once()
+        assert _levels(caplog, UNREADABLE + "term-1") == ["WARNING"]
+        assert "sending on its status alone" in caplog.text
+        assert ts._pane_check_holding == set()
+
+    def test_missing_pane_fails_as_it_did_and_is_not_called_a_dialog(self, caplog):
+        """tmux's get_history raises ValueError for a session or window that is
+        gone. The check lets that pass, and the dispatch then fails on its own
+        next pane read exactly as it did before the check ran on tmux."""
+        gone = ValueError("Session 'cao-session' not found")
+        backend = _tmux(gone)
+        with (
+            _terminal(_claude(), backend, status=TerminalStatus.IDLE),
+            caplog.at_level("DEBUG"),
+        ):
+            with pytest.raises(ts.TerminalRowMissingError, match="not found") as exc:
+                ts.dispatch_input(
+                    "term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE
+                )
+        assert not isinstance(exc.value, TerminalInputBlockedError)
+        assert exc.value.__cause__ is gone
+        backend.send_keys.assert_not_called()
+        assert _levels(caplog, HELD) == []
+        assert _levels(caplog, UNREADABLE + "term-1") == ["WARNING"]
+        assert ts._pane_check_holding == set()
+
+
+class TestTmuxBareEnterRecovery:
+    """An Enter is exactly what answers a dialog: the same check, on tmux too."""
+
+    def _recover(self, pane: Any, orchestration_type: Any, status: TerminalStatus) -> Any:
+        provider = _claude()
+        backend = _tmux(pane)
+        enters: List[str] = []
+        with (
+            _terminal(provider, backend, status=status),
+            patch.object(ts, "_capture_current_composer_region", return_value=MESSAGE),
+            patch.object(ts, "send_special_key", side_effect=lambda _tid, key: enters.append(key)),
+        ):
+            ts.redeliver_dropped_message_with_boundary(
+                "term-1",
+                MESSAGE,
+                1,
+                provider,
+                full_resend_requires_composer_evidence=True,
+                orchestration_type=orchestration_type,
+            )
+        return enters, backend
+
+    @pytest.mark.parametrize("name", TMUX_RACE_DIALOGS)
+    def test_no_enter_into_a_dialog_the_cached_status_missed(self, name, caplog):
+        """Fails without the tmux pane check: the Enter is sent."""
+        with caplog.at_level("INFO"):
+            enters, backend = self._recover(
+                DIALOG_PANES[name], OrchestrationType.SEND_MESSAGE, TerminalStatus.IDLE
+            )
+        assert enters == []
+        assert _screen_reads(backend) == [SCREEN_READ]
+        assert "the pre-send pane check found a dialog on screen" in caplog.text
+
+    def test_enter_is_resent_on_a_ready_pane_after_one_capture(self):
+        enters, backend = self._recover(
+            READY_PANES["turn_ended"], OrchestrationType.SEND_MESSAGE, TerminalStatus.IDLE
+        )
+        assert enters == ["Enter"]
+        assert _screen_reads(backend) == [SCREEN_READ]
+
+    def test_enter_is_resent_for_untyped_input_without_a_capture(self):
+        enters, backend = self._recover(
+            DIALOG_PANES["bash_permission_prompt"], None, TerminalStatus.IDLE
+        )
+        assert enters == ["Enter"]
+        assert _screen_reads(backend) == []
+
+    def test_status_guard_holds_the_enter_without_a_capture(self):
+        enters, backend = self._recover(
+            DIALOG_PANES["bash_permission_prompt"],
+            OrchestrationType.SEND_MESSAGE,
+            TerminalStatus.WAITING_USER_ANSWER,
+        )
+        assert enters == []
+        assert _screen_reads(backend) == []
+
+
+class TestTmuxHoldEpisodeLogging:
+    """The reconcile sweep retries a held message every 30 seconds on tmux: the
+    same episode logging as on herdr."""
+
+    def test_first_hold_in_full_then_debug_then_one_release_line(self, caplog):
+        backend = _tmux(DIALOG_PANES[ASK_USER_QUESTION])
+        with _tmux_inbox(backend, TerminalStatus.IDLE) as (service, update):
+            with caplog.at_level("DEBUG"):
+                service.deliver_pending("term-1")
+                for line, level in HOLD_LINES.items():
+                    assert _levels(caplog, line) == [level], line
+
+                caplog.clear()
+                for _ in range(2):
+                    service.deliver_pending("term-1")
+                for line in HOLD_LINES:
+                    assert _levels(caplog, line) == ["DEBUG", "DEBUG"], line
+                assert _levels(caplog, RELEASED) == []
+                assert update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+                backend.send_keys.assert_not_called()
+
+                caplog.clear()
+                backend.get_history.return_value = READY_PANES["idle_after_permission"]
+                service.deliver_pending("term-1")
+                backend.send_keys.assert_called_once()
+                assert [r.getMessage() for r in caplog.records if RELEASED in r.getMessage()] == [
+                    "Pre-send pane check released term-1: no dialog on screen any more"
+                ]
+                assert _levels(caplog, RELEASED) == ["INFO"]
+                for line in HOLD_LINES:
+                    assert _levels(caplog, line) == [], line
+
+                # Still ready: the release is not said again.
+                caplog.clear()
+                ts.dispatch_input(
+                    "term-1", MESSAGE, orchestration_type=OrchestrationType.SEND_MESSAGE
+                )
+                assert _levels(caplog, RELEASED) == []
+        assert ts._pane_check_holding == set()
+
+
+class TestReadOnRealTmuxBackend:
+    """What the check asks tmux for, through the real backend and client."""
+
+    def test_one_plain_text_capture_of_the_viewport(self):
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        frame = DIALOG_PANES["bash_permission_prompt"]
+        pane = MagicMock()
+        # libtmux hands capture-pane back as rows, with trailing blank rows dropped.
+        pane.cmd.return_value = MagicMock(stdout=frame.rstrip("\n").split("\n"))
+        window = MagicMock()
+        window.panes = [pane]
+        session = MagicMock()
+        session.windows.get.return_value = window
+        with patch("cli_agent_orchestrator.clients.tmux.libtmux") as libtmux:
+            libtmux.Server.return_value.sessions.get.return_value = session
+            backend = TmuxBackend(client=TmuxClient())
+        with (
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-session", "tmux_window": "developer-abcd"},
+            ),
+        ):
+            assert backend.supports_event_inbox() is False
+            assert (
+                ts._pre_send_pane_check_holds("term-1", _claude(), OrchestrationType.SEND_MESSAGE)
+                is True
+            )
+        # The rendered viewport only (-S 0), as text: no -e escapes, no -J rejoin.
+        assert pane.cmd.call_args_list == [call("capture-pane", "-p", "-S", "0")]
+
+    def test_a_window_that_is_gone_is_not_a_hold(self, caplog):
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        with patch("cli_agent_orchestrator.clients.tmux.libtmux") as libtmux:
+            libtmux.Server.return_value.sessions.get.return_value = None
+            backend = TmuxBackend(client=TmuxClient())
+        with (
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-session", "tmux_window": "developer-abcd"},
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            assert (
+                ts._pre_send_pane_check_holds("term-1", _claude(), OrchestrationType.SEND_MESSAGE)
+                is False
+            )
+        assert _levels(caplog, UNREADABLE + "term-1") == ["WARNING"]

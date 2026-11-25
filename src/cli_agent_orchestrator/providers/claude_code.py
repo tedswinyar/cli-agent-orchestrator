@@ -1992,7 +1992,7 @@ class ClaudeCodeProvider(BaseProvider):
             (
                 re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
                 # The "Review your answers" page has no footer (#896); the same
-                # structural check the raw path and the herdr pane check run.
+                # structural check the raw path and the pre-send pane check run.
                 or self._review_answers_page_at_bottom(rows)
             )
             and not re.search(TRUST_PROMPT_PATTERN, joined)

@@ -7,20 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **tmux: inbox messages are no longer typed into a Claude Code dialog that opened a moment
+  ago** (#405). On tmux CAO decided whether a terminal was waiting on a dialog from its
+  cached status, which is updated as terminal output is processed. A dialog that opened after
+  the status was last computed was typed into: the dialog swallowed the message and the
+  trailing Enter answered a question meant for a person. Before typing an inbox message,
+  assign or handoff into a Claude Code terminal, CAO now also looks at the screen, as it
+  already did on herdr (#896), and if a dialog is open the message stays queued until the
+  dialog is answered. The Enter that re-submits an unsubmitted message is checked the same
+  way, and so is eager delivery, which sends while the status still reads processing. This
+  costs one `tmux capture-pane` of the visible screen per such send, plus the tmux lookups
+  that find the pane, run off the event loop; a capture that fails does not hold delivery.
+  What remains is a dialog that opens in the milliseconds between that capture and the paste.
+  A provider that cannot recognise a dialog on screen is not read at all, on either backend.
+
 - **herdr: inbox messages are no longer typed into an open Claude Code dialog** (#896). herdr
   can report a pane as idle or done while an AskUserQuestion, permission or plan-approval
   dialog is open; CAO then typed the queued message into the dialog, which swallowed it and
   took the trailing Enter as the answer. On the herdr backends CAO now reads the pane before
   typing an inbox message, assign or handoff into a Claude Code terminal, and if a dialog is
   on screen the message stays queued until the dialog is answered. This costs one pane read
-  per delivery on herdr, and a failed pane read does not hold delivery. tmux reads nothing
-  extra. Two AskUserQuestion pages that Claude Code 2.1.330 draws for a call with several
-  questions are now recognised as dialogs, on herdr and in tmux status detection alike, where
-  they are reported as `waiting_user_answer`: a question page whose footer reads
+  per delivery on herdr, and a failed pane read does not hold delivery. Two AskUserQuestion
+  pages that Claude Code 2.1.330 draws for a call with several questions are now recognised
+  as dialogs, on herdr and in tmux status detection alike, where they are reported as
+  `waiting_user_answer`: a question page whose footer reads
   `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`, and the final "Review your
   answers" page, which has no footer. A send held by the pane check says so in its error
   ("its reported status was <status>, but a dialog is open on screen") and logs
-  `Native-status pane check held input to <terminal>`. While a dialog stays open the hold is
+  `Pre-send pane check held input to <terminal>`. While a dialog stays open the hold is
   logged once when it starts and once when it ends, and the retries in between are logged at
   DEBUG.
 
