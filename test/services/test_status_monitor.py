@@ -1140,6 +1140,34 @@ class TestScreenDetection:
 
         assert sm._last_status["t1"] is TerminalStatus.ERROR
 
+    @pytest.mark.parametrize(
+        "fixture",
+        ["claude_code_405_plan_approval_2_1_209", "claude_code_896_herdr_plan_approval"],
+    )
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_claude_plan_approval_dialog_replaces_processing(self, mock_pm, mock_settings, fixture):
+        """#405: the plan dialog read UNKNOWN on the screen path, and UNKNOWN never
+        overwrites a known status, so a terminal that reached the dialog from a
+        busy turn kept PROCESSING. Real captures (2.1.209 under tmux, attached to
+        #405 by its reporter; 2.1.330 through herdr) fed through the real ingestion
+        path and pyte screen.
+        """
+
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        frame = (Path(__file__).parents[1] / f"providers/fixtures/{fixture}.txt").read_text(
+            encoding="utf-8"
+        )
+        mock_pm.get_provider.return_value = ClaudeCodeProvider("t1", "s", "w")
+        mock_settings.return_value = {"state_buffer_max": 32768}
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", frame.rstrip("\n").replace("\n", "\r\n"))
+
+        assert sm._last_status["t1"] is TerminalStatus.WAITING_USER_ANSWER
+
     def test_private_device_status_query_does_not_break_pyte_feed(self):
         """pyte 0.8.2 passes ``private=True`` to DSR handlers.
 

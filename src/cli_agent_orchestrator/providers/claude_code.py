@@ -202,6 +202,32 @@ WAITING_USER_ANSWER_PATTERN = (
     r"|Enter to select[ \t]*·[ \t]*(?:Tab/Arrow keys|[Aa]rrow keys|[Aa]rrows|↑↓) to navigate"
 )
 PLAN_APPROVAL_PATTERN = r"Would you like to proceed\?"
+# The plan-approval dialog (#405; Claude Code 2.1.209 and 2.1.330 captures in
+# test/providers/fixtures/claude_code_405_plan_approval_2_1_209.txt and
+# claude_code_896_herdr_plan_approval.txt):
+#
+#   Claude has written up a plan and is ready to execute. Would you like to proceed?
+#
+#   ❯ 1. Yes, and bypass permissions
+#     2. Yes, manually approve edits
+#     3. Tell Claude what to change
+#        shift+tab to approve with this feedback
+#
+#   ctrl+g to edit in Vim · ~/.claude/plans/<name>.md
+#
+# It has NO footer. The question alone is a sentence an agent can print, so it is matched by
+# structure (see ``_plan_approval_dialog_at_bottom``): the question, then numbered choice rows
+# below it, one of them carrying the Select cursor. A numbered list an agent wrote has no
+# cursor; a live Select always has one. "[^\S\n]" is whitespace within one row (it keeps the
+# TUI's non-breaking space): an idle prompt row above a numbered row is not a cursor, and the
+# choice pattern finds the same rows as #481's "^\s*(?:[❯>]\s*)?\d+\." without rescanning runs
+# of blank rows from every row start.
+_PLAN_CHOICE_PATTERN = re.compile(r"^[^\S\n]*(?:[❯>][^\S\n]*)?\d+\.", re.MULTILINE)
+_PLAN_CHOICE_CURSOR_PATTERN = re.compile(r"^[^\S\n]*[❯>][^\S\n]*\d+\.", re.MULTILINE)
+# The rule a NAMED session draws as the last row under a dialog, e.g. "──────── my-session ─"
+# (claude_code_896_herdr_named_session_single.txt). Unlike the input box's rails it has
+# nothing under it, so it is not evidence that the screen moved on past a dialog.
+_SESSION_NAME_RULE_PATTERN = re.compile(r"^[ \t]*─{8,}[ \t]+\S(?:.*\S)?[ \t]+─+[ \t]*$")
 # The last page of a multi-question AskUserQuestion (#896, Claude Code 2.1.330):
 #
 #   ←  ☒ Color  ☒ Size  ✔ Submit  →
@@ -1494,6 +1520,50 @@ class ClaudeCodeProvider(BaseProvider):
         )
 
     @staticmethod
+    def _plan_approval_dialog_at_bottom(rows: List[str]) -> bool:
+        """Whether escape-free rows end in the plan-approval dialog (#405).
+
+        The one definition, shared by the buffer path (through
+        ``_user_answer_dialog_at_bottom``) and ``get_status_from_screen``.
+        Structure, all within the last ``_DIALOG_BOTTOM_LINES`` rows handed in:
+
+        - the question "Would you like to proceed?";
+        - below it numbered choice rows, one of them carrying the Select cursor;
+        - no rule (────) after the question and no response marker (⏺/●) after
+          the last choice: either means the agent proceeded past the dialog and
+          it is transcript. The session-name rule a named session draws as the
+          last row under a dialog is neither.
+
+        The region is counted in the caller's rows. The buffer path hands in
+        physical lines, as it has since #481. The screen path hands in its
+        blank-free rows, so the blank rows inside the dialog and any padding
+        pyte keeps around it cost nothing: the 2.1.209 capture needs 7 rows
+        (question, four choices, the feedback hint, the editor hint) and 8 with
+        a session-name rule, each further choice one more.
+        """
+        region = rows[-_DIALOG_BOTTOM_LINES:]
+        last = next((i for i in range(len(region) - 1, -1, -1) if region[i].strip()), None)
+        if last is not None and _SESSION_NAME_RULE_PATTERN.match(region[last]):
+            region = region[:last]
+        bottom_region = "\n".join(region)
+        plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
+        if not plan_match:
+            return False
+        after_plan = bottom_region[plan_match.end() :]
+        last_option = None
+        for last_option in _PLAN_CHOICE_PATTERN.finditer(after_plan):
+            pass
+        if last_option is None or not _PLAN_CHOICE_CURSOR_PATTERN.search(after_plan):
+            return False
+        if re.search(r"─{20,}", after_plan):
+            return False
+        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN): the newest TUI's
+        # response marker is ● which RESPONSE_PATTERN deliberately excludes, and
+        # its effort-footer lookahead keeps a "● high · /effort" line from
+        # counting as dismissal evidence.
+        return not EXTRACTION_RESPONSE_PATTERN.search(after_plan[last_option.end() :])
+
+    @staticmethod
     def _user_answer_dialog_at_bottom(output: str) -> bool:
         """Whether escape-free pane text ends in a dialog only a user may answer.
 
@@ -1533,32 +1603,8 @@ class ClaudeCodeProvider(BaseProvider):
             if re.search(WAITING_USER_ANSWER_PATTERN, bottom_chrome):
                 return True
             # Plan-approval: "Would you like to proceed?" with no nav footer.
-            # Guard against dismissed dialog in scrollback: only classify as
-            # WAITING if option markers appear AFTER the plan text AND neither
-            # a separator (────) nor a response marker (⏺/●) follows them —
-            # either indicates the agent proceeded past the dialog.
-            plan_match = re.search(PLAN_APPROVAL_PATTERN, bottom_region)
-            if plan_match:
-                after_plan = bottom_region[plan_match.end() :]
-                has_option_markers = re.search(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE)
-                sep_after_plan = re.search(r"─{20,}", after_plan)
-                response_after_options = False
-                if has_option_markers:
-                    last_option = None
-                    for m in re.finditer(r"^\s*(?:[❯>]\s*)?\d+\.", after_plan, re.MULTILINE):
-                        last_option = m
-                    if last_option:
-                        after_options = after_plan[last_option.end() :]
-                        # EXTRACTION_RESPONSE_PATTERN (not RESPONSE_PATTERN):
-                        # the newest TUI's response marker is ● which
-                        # RESPONSE_PATTERN deliberately excludes, and its
-                        # effort-footer lookahead keeps a "● high · /effort"
-                        # line from counting as dismissal evidence.
-                        response_after_options = bool(
-                            EXTRACTION_RESPONSE_PATTERN.search(after_options)
-                        )
-                if has_option_markers and not sep_after_plan and not response_after_options:
-                    return True
+            if ClaudeCodeProvider._plan_approval_dialog_at_bottom(lines):
+                return True
             # AskUserQuestion "Review your answers": no footer either (#896).
             if ClaudeCodeProvider._review_answers_page_at_bottom(lines):
                 return True
@@ -1906,9 +1952,10 @@ class ClaudeCodeProvider(BaseProvider):
         does not need to tolerate mid-repaint frames.
 
         Precedence: a live spinner in the bottom region wins (PROCESSING); then
-        the Ink selection footer (WAITING_USER_ANSWER); then, if the BOXED input
-        prompt is visible, COMPLETED when a response/completion-summary is on
-        screen above it, else IDLE.
+        the Ink selection footer, or one of the two footerless dialogs, the
+        "Review your answers" page and plan approval (WAITING_USER_ANSWER);
+        then, if the BOXED input prompt is visible, COMPLETED when a
+        response/completion-summary is on screen above it, else IDLE.
 
         The prompt must be the real input box — a ``❯``/``>`` line adjacent to a
         ``────`` separator — NOT any line containing ``> ``. During launch the
@@ -1994,6 +2041,10 @@ class ClaudeCodeProvider(BaseProvider):
                 # The "Review your answers" page has no footer (#896); the same
                 # structural check the raw path and the herdr pane check run.
                 or self._review_answers_page_at_bottom(rows)
+                # Plan approval has no footer either (#405). It ranks with the
+                # other dialogs: under the trust / bypass / model-upgrade
+                # exclusions, and ahead of the background-wait line below.
+                or self._plan_approval_dialog_at_bottom(rows)
             )
             and not re.search(TRUST_PROMPT_PATTERN, joined)
             and not re.search(BYPASS_PROMPT_PATTERN, joined)
@@ -2071,9 +2122,9 @@ class ClaudeCodeProvider(BaseProvider):
         """Whether a fresh pane read ends in a dialog that would swallow a paste (#896).
 
         Runs the buffer path's detection rather than ``get_status_from_screen``:
-        it is the only one that knows the plan-approval dialog (#405), and its
-        6-line footer window is the tighter of the two against agent prose that
-        merely quotes a footer. A rendered pane pads the rows under the TUI with
+        its 6-line footer window is the tighter of the two against agent prose
+        that merely quotes a footer, and it answers the one question asked here
+        without the spinner and input-box logic around it. A rendered pane pads the rows under the TUI with
         blanks, which the buffer path never sees, so they are dropped first to
         keep the footer inside that window. Trust, bypass and model-upgrade
         dialogs stay excluded, as in ``get_status``: ``initialize`` answers those.

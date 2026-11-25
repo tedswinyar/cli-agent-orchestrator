@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Claude Code: the plan-approval dialog is reported as `waiting_user_answer` on tmux**
+  (#405). A Claude Code terminal showing "Claude has written up a plan and is ready to
+  execute. Would you like to proceed?" kept its previous status, usually `processing`, because
+  the screen reader that decides status on tmux by default did not know that dialog. It is now
+  reported as `waiting_user_answer`, so queued inbox messages, assign and handoff are held
+  until the plan is answered. The detection is the one the raw-buffer reader has had since
+  #481, now shared by both, and it additionally requires the `❯` selection cursor on one of
+  the numbered choices, so a reply that quotes the question above a plain numbered list is
+  not taken for the dialog. A session-name rule drawn under the dialog in a named session no
+  longer hides it.
+
 - **herdr: inbox messages are no longer typed into an open Claude Code dialog** (#896). herdr
   can report a pane as idle or done while an AskUserQuestion, permission or plan-approval
   dialog is open; CAO then typed the queued message into the dialog, which swallowed it and
