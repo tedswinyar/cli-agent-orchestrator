@@ -1,0 +1,49 @@
+
+     - Every claimed frame is grep-checked for [38;5;153m↑/↓ to navigate[39m before the claim ships —
+[38;5;153m▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+[39m  [38;5;73m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m   [1m[38;5;153mReady to code?[0m
+
+   Here is Claude's plan:
+  [38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m   [1;3;4mPlan: assemble the frame corpus for issue #405[0m
+
+   [1mContext[0m
+
+   The upstream maintainer asked for real captured terminal frames before changing
+   dialog detection. This plan covers assembling those captures into a corpus
+   directory with provenance notes, so the maintainer can pin patterns against real
+   chrome instead of guessing.
+
+   This particular plan file is deliberately written without quoting any detection
+   string, so that the approval prompt rendered from it is a clean specimen.
+
+   [1mSteps[0m
+
+   1. Collect the captures taken this session into a corpus directory.
+   2. Write a README recording, for each frame: date, CLI version, pane geometry,
+   what was on screen, and the expected classification.
+   3. Keep both the plain and escape-preserving variant of every frame.
+   4. Hand the corpus to the user to attach to the issue thread.
+
+   [1mFiles[0m
+
+   - New: corpus directory under the repo's capture area, plus its README.
+
+   [1mVerification[0m
+
+   - Each frame is checked against the real provider code before any claim about it
+   ships.
+   - Both variants of every frame are present and byte-exact, never hand-trimmed.
+  [38;5;239m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+[39m  [38;5;73m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m   [38;5;246mClaude has written up a plan and is ready to execute. Would you like to proceed?[39m
+
+   [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes, and bypass permissions[39m
+     [38;5;246m2. [39mYes, manually approve edits
+     [38;5;246m3. [39mNo, refine with Ultraplan on Claude Code on the web
+     [38;5;246m4. Tell Claude what to change[39m
+        [38;5;246mshift+tab to approve with this feedback[39m
+
+   [38;5;246mctrl+g to edit in [39m [1m[38;5;246mNvim[0m [38;5;246m · ~/.claude/plans/recursive-plotting-candle.md[39m

@@ -4396,9 +4396,8 @@ class TestClaudeCode896HerdrDialogFixtures:
     Both now are, on both paths, because the footer arm lives in the shared
     ``WAITING_USER_ANSWER_PATTERN`` and the review page is one helper both call.
 
-    Plan approval is still recognised by the raw path only: the screen path has
-    no plan-approval branch (#405). That gap is older than these fixtures and is
-    pinned here, not changed.
+    Plan approval was recognised by the raw path only until #405 gave the screen
+    path the same check; ``TestClaudeCode405PlanApproval`` covers it.
     """
 
     FIXTURES = Path(__file__).parent / "fixtures"
@@ -4416,11 +4415,15 @@ class TestClaudeCode896HerdrDialogFixtures:
         "named_session_two_question_preview_page1",
         "named_session_two_question_preview_page2",
         "review_page_named_session",
+        "plan_approval",
     ]
     READY = {
         "idle": TerminalStatus.IDLE,
         "finished_turn": TerminalStatus.COMPLETED,
         "named_session_idle": TerminalStatus.COMPLETED,
+        # The pane once the plan was approved (#405): the dialog is gone and the
+        # reply even asks "Want me to proceed and create the README.md?".
+        "plan_approved": TerminalStatus.COMPLETED,
     }
 
     @classmethod
@@ -4441,7 +4444,7 @@ class TestClaudeCode896HerdrDialogFixtures:
             provider.mark_input_received()
         return provider
 
-    @pytest.mark.parametrize("name", DIALOGS + ["plan_approval"])
+    @pytest.mark.parametrize("name", DIALOGS)
     @pytest.mark.parametrize("dispatched", [False, True])
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_dialog_is_waiting_user_answer_on_raw_path(self, mock_backend, name, dispatched):
@@ -4460,12 +4463,6 @@ class TestClaudeCode896HerdrDialogFixtures:
             self._provider(mock_backend, dispatched=dispatched).get_status_from_screen(frame)
             == TerminalStatus.WAITING_USER_ANSWER
         )
-
-    @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_plan_approval_is_unknown_on_screen_path(self, mock_backend):
-        """Pre-existing gap (#405), pinned so a change to it is a decision."""
-        frame = self._frame("plan_approval")
-        assert self._provider(mock_backend).get_status_from_screen(frame) == TerminalStatus.UNKNOWN
 
     @pytest.mark.parametrize("name", sorted(READY))
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -4546,3 +4543,292 @@ class TestClaudeCode896HerdrDialogFixtures:
         provider = self._provider(mock_backend)
         assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
         assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+
+class TestClaudeCode405PlanApproval:
+    """The plan-approval dialog on the screen path (#405).
+
+    ``get_status_from_screen`` decides status on tmux by default, and it had no
+    plan-approval branch: the dialog read UNKNOWN, which never overwrites a known
+    status, so the terminal kept PROCESSING. It now runs the check the raw path
+    has had since #481, through one shared helper.
+
+    Real frames, none hand-written:
+
+    - ``claude_code_405_plan_approval_2_1_209.txt`` and ``..._sgr.txt``: Claude
+      Code 2.1.209 in a 213x49 tmux pane, ``tmux capture-pane -p`` and ``-pe``,
+      byte-exact as attached to #405 by GitHub user chaogebaba (frame 02 of
+      issue-405-frames.zip). Its scrollback row 2 quotes "↑/↓ to navigate"; the
+      dialog itself has no footer.
+    - ``claude_code_896_herdr_plan_approval.txt``: Claude Code 2.1.330, read
+      through herdr (#896).
+    - ``claude_code_896_herdr_plan_approved.txt``: the same session after the plan
+      was approved.
+    - ``claude_code_405_plan_approval_80col_2_1_330.txt``: Claude Code 2.1.330 in
+      the 80x22 tmux pane a headless ``cao launch`` gives. The question wraps:
+      "... Would you like to" / "proceed?". The first version of this fix missed
+      it, live: a message was typed in and its Enter approved the plan.
+    - ``claude_code_405_plan_approval_named_session_2_1_330.txt`` (200 columns)
+      and ``..._named_session_80col_2_1_330.txt``: the dialog in a named session,
+      with the session-name rule as the last row. Approving a plan names the
+      session, so every plan dialog after the first looks like this. In these
+      two the home directory in the plan text is replaced with /home/username.
+
+    Frames built from those (a reply spliced above a real input box, a row
+    replaced, the cursor blanked) say so in the test that builds them.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+    PLAN_FRAMES = {
+        "2.1.209-tmux": "claude_code_405_plan_approval_2_1_209",
+        "2.1.330-herdr": "claude_code_896_herdr_plan_approval",
+        "2.1.330-tmux-named": "claude_code_405_plan_approval_named_session_2_1_330",
+        "2.1.330-tmux-80col": "claude_code_405_plan_approval_80col_2_1_330",
+        "2.1.330-tmux-80col-named": "claude_code_405_plan_approval_named_session_80col_2_1_330",
+    }
+    DIALOG_FIXTURES = [
+        "claude_code_310_bash_permission_prompt",
+        "claude_code_310_write_permission_prompt",
+        "claude_code_405_plan_approval_2_1_209",
+        *(f"claude_code_896_herdr_{name}" for name in TestClaudeCode896HerdrDialogFixtures.DIALOGS),
+    ]
+    READY_FIXTURES = {
+        "claude_code_310_permission_idle_after": TerminalStatus.COMPLETED,
+        "claude_code_865_startup_idle": TerminalStatus.IDLE,
+        "claude_code_865_turn_ended": TerminalStatus.COMPLETED,
+        "claude_code_896_herdr_finished_turn": TerminalStatus.COMPLETED,
+        "claude_code_896_herdr_idle": TerminalStatus.IDLE,
+        "claude_code_896_herdr_named_session_idle": TerminalStatus.COMPLETED,
+        "claude_code_896_herdr_plan_approved": TerminalStatus.COMPLETED,
+    }
+    # What an agent describing the dialog could leave as its reply.
+    REPLIES = {
+        "question-ends-the-reply": ["● The plan is written. Would you like to proceed?"],
+        "numbered-list-without-the-question": [
+            "● Next steps:",
+            "  1. Yes, and use auto mode",
+            "  2. Yes, manually approve edits",
+        ],
+        "question-then-list-without-cursor": [
+            "● Claude has written up a plan and is ready to execute. Would you like to proceed?",
+            "",
+            "  1. Yes, and use auto mode",
+            "  2. Yes, manually approve edits",
+            "  3. Tell Claude what to change",
+        ],
+    }
+
+    @classmethod
+    def _frame(cls, stem: str) -> list:
+        return (cls.FIXTURES / f"{stem}.txt").read_text(encoding="utf-8").split("\n")
+
+    @staticmethod
+    def _provider(mock_backend, *, dispatched: bool = False) -> ClaudeCodeProvider:
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        if dispatched:
+            provider.mark_input_received()
+        return provider
+
+    @classmethod
+    def _dialog_rows(cls, stem: str) -> list:
+        """The dialog itself: the question row to the last non-blank row."""
+        frame = cls._frame(stem)
+        while not frame[-1].strip():
+            frame.pop()
+        # "Would you like to" starts the question; an 80-column pane wraps "proceed?".
+        (question,) = [i for i, row in enumerate(frame) if "Would you like to" in row]
+        return frame[question:]
+
+    @classmethod
+    def _above_input_box(cls, ready_stem: str, reply: list, rows_above: int = 0) -> list:
+        """``reply`` spliced into a real ready pane, ``rows_above`` rows over its input box."""
+        frame = cls._frame(ready_stem)
+        top_rail = max(i for i, row in enumerate(frame) if row.startswith("────")) - 2
+        assert frame[top_rail].startswith("────") and frame[top_rail + 1].startswith("❯")
+        at = top_rail - rows_above
+        return frame[:at] + reply + frame[at:]
+
+    @pytest.mark.parametrize("version", sorted(PLAN_FRAMES))
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_plan_dialog_is_waiting_user_answer_on_screen_path(
+        self, mock_backend, version, dispatched
+    ):
+        """The gap #405 reported. UNKNOWN before this change."""
+        frame = self._frame(self.PLAN_FRAMES[version])
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status_from_screen(frame)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize("version", sorted(PLAN_FRAMES))
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_plan_dialog_as_pyte_renders_it(self, mock_backend, version):
+        """Every row padded to the screen width, blank rows down to the screen height."""
+        frame = self._frame(self.PLAN_FRAMES[version])
+        screen = [row.ljust(400) for row in frame] + [" " * 400] * (200 - len(frame))
+        assert (
+            self._provider(mock_backend).get_status_from_screen(screen)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize(
+        "stem", [*sorted(PLAN_FRAMES.values()), "claude_code_405_plan_approval_2_1_209_sgr"]
+    )
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_plan_dialog_is_waiting_user_answer_on_raw_path(self, mock_backend, stem, dispatched):
+        """Unchanged since #481, including on the capture that keeps its escapes."""
+        text = "\n".join(self._frame(stem))
+        provider = self._provider(mock_backend, dispatched=dispatched)
+        assert provider.get_status(text) == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.shows_user_answer_dialog(text) is True
+
+    @pytest.mark.parametrize("stem", DIALOG_FIXTURES)
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_both_paths_agree_on_every_dialog_capture(self, mock_backend, stem):
+        frame = self._frame(stem)
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status_from_screen(frame) == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize("stem", sorted(READY_FIXTURES))
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_both_paths_agree_on_every_ready_capture(self, mock_backend, stem):
+        frame = self._frame(stem)
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == self.READY_FIXTURES[stem]
+        assert provider.get_status_from_screen(frame) == self.READY_FIXTURES[stem]
+        assert provider.shows_user_answer_dialog("\n".join(frame)) is False
+
+    @pytest.mark.parametrize("reply", sorted(REPLIES))
+    @pytest.mark.parametrize("rows_above", [0, 12], ids=["newest-output", "mid-transcript"])
+    @pytest.mark.parametrize(
+        "ready", ["claude_code_896_herdr_finished_turn", "claude_code_896_herdr_named_session_idle"]
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_reply_using_the_dialog_wording_is_completed(
+        self, mock_backend, ready, rows_above, reply
+    ):
+        """Agent prose above a real idle input box is not a dialog, on either path."""
+        frame = self._above_input_box(ready, self.REPLIES[reply], rows_above)
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.shows_user_answer_dialog("\n".join(frame)) is False
+
+    @pytest.mark.parametrize("version", sorted(PLAN_FRAMES))
+    @pytest.mark.parametrize(
+        "ready", ["claude_code_896_herdr_finished_turn", "claude_code_896_herdr_named_session_idle"]
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_verbatim_quote_of_the_dialog_above_the_input_box_is_completed(
+        self, mock_backend, ready, version
+    ):
+        """The whole dialog, cursor included, quoted as the newest output.
+
+        The input box under it is what tells it from the live dialog: its top
+        rail is a rule after the question. In a named session that rail is the
+        session-name rule, which only counts as nothing when it is the last row.
+        """
+        quote = ["● The dialog reads:", *self._dialog_rows(self.PLAN_FRAMES[version]), ""]
+        frame = self._above_input_box(ready, quote)
+        provider = self._provider(mock_backend)
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.COMPLETED
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.shows_user_answer_dialog("\n".join(frame)) is False
+
+    @pytest.mark.parametrize("version", sorted(PLAN_FRAMES))
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_choice_list_without_the_cursor_is_not_the_dialog(self, mock_backend, version):
+        """The real frames with the cursor blanked: the question over a plain numbered list.
+
+        Nothing else on the frame rules it out (no rule, no response marker
+        below), so this is the cursor requirement alone. #481 did not have it.
+        """
+        frame = self._frame(self.PLAN_FRAMES[version])
+        (cursor,) = [i for i, row in enumerate(frame) if row.lstrip().startswith("❯ 1.")]
+        frame[cursor] = frame[cursor].replace("❯", " ")
+        provider = self._provider(mock_backend)
+        assert provider.get_status_from_screen(frame) != TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status("\n".join(frame)) != TerminalStatus.WAITING_USER_ANSWER
+        assert provider.shows_user_answer_dialog("\n".join(frame)) is False
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_session_name_rule_under_the_dialog_does_not_hide_it(self, mock_backend):
+        """Composed: the real named-session captures are in ``PLAN_FRAMES``.
+
+        This one puts a different session's rule under the herdr-read frame.
+        The 2.1.330 plan frame with the rule a named session draws as the last
+        row under every dialog captured in one, taken from
+        claude_code_896_herdr_named_session_single.txt. #481 read any rule after
+        the question as "the agent moved on", which would hide the dialog here.
+        """
+        frame = self._frame("claude_code_896_herdr_plan_approval")
+        while not frame[-1].strip():
+            frame.pop()
+        rule = [r for r in self._frame("claude_code_896_herdr_named_session_single") if r][-1]
+        assert rule.startswith("────") and rule.endswith(" add-readme-file ─")
+        frame.append(rule)
+        provider = self._provider(mock_backend)
+        assert provider.get_status_from_screen(frame) == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status("\n".join(frame)) == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_plan_dialog_outranks_a_background_wait_line(self, mock_backend):
+        """A dialog the user has to answer is never masked as "working" (GH #392 order).
+
+        The 2.1.330 frame with its blank first row replaced by a wait line.
+        """
+        frame = self._frame("claude_code_896_herdr_plan_approval")
+        assert not frame[0].strip()
+        frame[0] = "✻ Waiting for 1 dynamic workflow to finish"
+        assert (
+            self._provider(mock_backend).get_status_from_screen(frame)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize(
+        "startup_row",
+        ["   Yes, I trust this folder", "  2. Yes, I accept", "Newer Opus model available"],
+        ids=["trust", "bypass", "model-upgrade"],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_plan_check_obeys_the_startup_dialog_exclusions(self, mock_backend, startup_row):
+        """Same exclusions as the footer check: ``initialize`` answers those dialogs.
+
+        The 2.1.330 frame with its blank first row replaced by the excluded row.
+        """
+        frame = self._frame("claude_code_896_herdr_plan_approval")
+        assert not frame[0].strip()
+        frame[0] = startup_row
+        assert (
+            self._provider(mock_backend).get_status_from_screen(frame)
+            != TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            (Path(__file__).parent / "fixtures" / "claude_code_1277_resume_trust_dialog.txt")
+            .read_text(encoding="utf-8")
+            .split("\n"),
+            [
+                "WARNING: Bypass Permissions mode",
+                "❯ 1. No, exit",
+                "  2. Yes, I accept",
+                "Enter to select · ↑/↓ to navigate · Esc to cancel",
+            ],
+            _UPGRADE_NUDGE_FRAME.split("\n"),
+        ],
+        ids=["trust-capture", "bypass", "model-upgrade"],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_startup_dialogs_are_still_not_waiting_on_screen_path(self, mock_backend, frame):
+        assert (
+            self._provider(mock_backend).get_status_from_screen(frame)
+            != TerminalStatus.WAITING_USER_ANSWER
+        )

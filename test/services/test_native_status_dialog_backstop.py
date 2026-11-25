@@ -95,11 +95,13 @@ HERDR_DIALOG_SHAPES = [
     "review_page_named_session",
     "plan_approval",
 ]
-HERDR_READY_SHAPES = ["idle", "finished_turn", "named_session_idle"]
+HERDR_READY_SHAPES = ["idle", "finished_turn", "named_session_idle", "plan_approved"]
 
 DIALOG_PANES = {
     "bash_permission_prompt": _fixture("claude_code_310_bash_permission_prompt"),
     "write_permission_prompt": _fixture("claude_code_310_write_permission_prompt"),
+    # Claude Code 2.1.209 under tmux, as attached to #405 by its reporter.
+    "plan_approval_2_1_209": _fixture("claude_code_405_plan_approval_2_1_209"),
     **{f"herdr_{shape}": _herdr(shape) for shape in HERDR_DIALOG_SHAPES},
 }
 ASK_USER_QUESTION = "herdr_single_question"
@@ -251,12 +253,18 @@ class TestProviderDialogCheck:
     def test_blank_pane_is_not_a_dialog(self, pane):
         assert _claude().shows_user_answer_dialog(pane) is False
 
-    def test_plan_approval_is_seen_only_by_the_buffer_path_detection(self):
-        """Why the method reuses get_status's detection, not get_status_from_screen (#405)."""
-        provider = _claude()
-        rows = DIALOG_PANES[PLAN_APPROVAL].split("\n")
-        assert provider.get_status_from_screen(rows) != TerminalStatus.WAITING_USER_ANSWER
-        assert provider.shows_user_answer_dialog(DIALOG_PANES[PLAN_APPROVAL]) is True
+    @pytest.mark.parametrize("name", sorted(DIALOG_PANES))
+    def test_agrees_with_the_screen_path_on_the_real_dialog_captures(self, name):
+        """Plan approval was the one capture the screen path missed, until #405."""
+        rows = DIALOG_PANES[name].split("\n")
+        assert _claude().get_status_from_screen(rows) == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.parametrize("name", sorted(n for n in READY_PANES if "wording" not in n))
+    def test_agrees_with_the_screen_path_on_the_ready_captures(self, name):
+        """Captures only. The spliced "wording" panes quote a footer, which the
+        screen path's 25-row footer window reads as a dialog (older than #405)."""
+        rows = READY_PANES[name].split("\n")
+        assert _claude().get_status_from_screen(rows) != TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.parametrize("name", sorted(DIALOG_PANES))
     def test_agrees_with_get_status_on_the_real_dialog_captures(self, name):

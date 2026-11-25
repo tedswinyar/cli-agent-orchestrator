@@ -44,7 +44,7 @@ The Claude Code provider detects terminal states by analyzing output patterns:
 
 - **IDLE**: Terminal shows `>` or `❯` prompt, ready for input
 - **PROCESSING**: Spinner characters visible (`✶`, `✢`, `✽`, `✻`, `·`, `✳`) with ellipsis and status text
-- **WAITING_USER_ANSWER**: Claude showing numbered selection options with `❯` cursor
+- **WAITING_USER_ANSWER**: Claude showing numbered selection options with `❯` cursor: an AskUserQuestion page, a tool permission prompt or the plan-approval dialog
 - **COMPLETED**: Response marker `⏺` present + idle prompt visible
 - **ERROR**: No recognizable output state
 
